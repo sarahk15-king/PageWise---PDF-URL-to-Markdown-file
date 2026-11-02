@@ -6,7 +6,6 @@ import os
 import re
 import shutil
 import tempfile
-import threading
 import time
 import unicodedata
 from datetime import date
@@ -2115,39 +2114,6 @@ def order_docling_like_reader(text, reader):
     return "\n\n".join(blocks)
 
 
-_engine_local = threading.local()   # the quality report of the request being handled in this thread
-
-
-def engine_quality_report(doc):
-    """What the engine is sure and unsure about, for the app's Extraction quality tab. No AI, no keys."""
-    shown = [e for e in doc.elements if e.in_markdown and e.type != "image"]
-    by_type = {}
-    for e in shown:
-        by_type[e.type] = by_type.get(e.type, 0) + 1
-    pages = {}
-    for e in shown:
-        pages.setdefault(e.page, []).append(e.confidence)
-    weak = []
-    for e in sorted(shown, key=lambda e: e.confidence):
-        limit = 0.8 if e.type == "table" else 0.6
-        if e.confidence < limit and "ocr" not in e.flags:
-            weak.append({
-                "page": e.page, "type": e.type, "confidence": round(e.confidence, 2),
-                "preview": " ".join(e.content.split())[:140],
-            })
-    return {
-        "average_confidence": round(sum(e.confidence for e in shown) / max(len(shown), 1), 3),
-        "pages": doc.pages,
-        "elements": len(shown),
-        "by_type": by_type,
-        "by_page": [{"page": p, "average": round(sum(c) / len(c), 3), "lowest": round(min(c), 3)} for p, c in sorted(pages.items())],
-        "weak": weak[:25],
-        "weak_count": len(weak),
-        "ocr_pages": doc.cost.get("ocr_pages", 0),
-        "ai_repaired": sum(1 for e in shown if "ai_repaired" in e.flags),
-    }
-
-
 def convert_with_engine(file_path):
     """Our own engine: typed elements with confidence scores, merged in reading order into Markdown."""
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
@@ -2157,10 +2123,6 @@ def convert_with_engine(file_path):
     quality = os.getenv("ENGINE_QUALITY", "economy").strip().lower()
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
-    try:
-        _engine_local.report = engine_quality_report(doc)
-    except Exception:
-        _engine_local.report = None
     return doc.to_markdown()
 
 
@@ -2773,7 +2735,6 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         warnings.append(f"Text, table and image extraction failed: {e}")
 
     # 3. Whole document as Markdown, with links to the images saved in S3
-    _engine_local.report = None
     started = time.time()
     try:
         converted = convert_pdf(tmp_path, tool)
@@ -2782,7 +2743,6 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
     seconds = round(time.time() - started, 2)
-    quality_report = getattr(_engine_local, "report", None) if tool == "engine" else None
     if tool == "markitdown":
         converted = fix_markdown_tables(converted, table_rows)
     markdown_text = place_images(converted, image_places)
@@ -2806,7 +2766,6 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         "tables": table_summaries,
         "warnings": warnings,
         "seconds": seconds,
-        "quality_report": quality_report,
     }
 
 
@@ -2960,13 +2919,3 @@ def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
         "tables": table_summaries,
         "warnings": warnings,
     }
-
-# ---- Brief summary of extracted text (Pagewise) ----------------------------------------------------
-@app.post("/summarize")
-def summarize_text(markdown: str = Form(...)):
-    from engine import summary
-
-    try:
-        return summary.summarize(markdown)
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=f"Summary failed: {error}")
