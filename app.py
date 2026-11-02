@@ -75,11 +75,9 @@ def tables_from_markdown(markdown_text):
 def doc_stats(markdown_text):
     lines = markdown_text.splitlines()
     return {
-        "Words": len(re.findall(r"\w+", markdown_text)),
-        "Headings": sum(1 for l in lines if re.match(r"#{1,6}\s", l)),
         "Tables": sum(1 for l in lines if re.fullmatch(r"\s*\|[\s:|\-]+\|\s*", l) and "---" in l),
-        "Formulas": markdown_text.count("$$") // 2,
         "Images": len(re.findall(r"!\[[^\]]*\]\(", markdown_text)),
+        "Formulas": markdown_text.count("$$") // 2,
     }
 
 
