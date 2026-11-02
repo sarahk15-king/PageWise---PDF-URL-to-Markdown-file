@@ -2919,3 +2919,36 @@ def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
         "tables": table_summaries,
         "warnings": warnings,
     }
+
+
+# ---- Images for the "Download everything" zip ------------------------------------------------------
+def image_zip_bytes(keys):
+    """A zip of the given images from S3. Only keys under assets/images/ are allowed."""
+    clean = []
+    for key in keys:
+        if not isinstance(key, str) or not key.startswith("assets/images/") or ".." in key:
+            raise HTTPException(status_code=400, detail="Only extracted images can be downloaded.")
+        clean.append(key)
+    if not clean or len(clean) > 100:
+        raise HTTPException(status_code=400, detail="Send between 1 and 100 image keys.")
+    import zipfile
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_STORED) as archive:
+        for key in clean:
+            body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+            archive.writestr(key.rsplit("/", 1)[-1], body)
+    return buffer.getvalue()
+
+
+@app.post("/image-files")
+def image_files(keys: str = Form(...)):
+    from fastapi import Response
+
+    try:
+        data = image_zip_bytes(json.loads(keys))
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Could not read the images: {error}")
+    return Response(content=data, media_type="application/zip")
