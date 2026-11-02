@@ -2118,7 +2118,9 @@ def convert_with_engine(file_path):
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
 
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
-    doc = extract_pdf(file_path, image_store=lambda name, png: "")
+    # economy = Python functions only; standard = plus Amazon Nova repair of weak tables and text (needs AI_REPAIR_ENABLED=true)
+    quality = os.getenv("ENGINE_QUALITY", "economy").strip().lower()
+    doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
     return doc.to_markdown()
 
