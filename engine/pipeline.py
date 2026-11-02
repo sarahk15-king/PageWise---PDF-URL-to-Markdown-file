@@ -51,8 +51,12 @@ def azure_page_elements(pdf_path, page_no):
         return None
 
 
-def extract_pdf(path, image_store=None, out_dir=None, max_pages=60):
-    """PDF in, Document out (Document.to_markdown() and Document.to_json())."""
+def extract_pdf(path, image_store=None, out_dir=None, max_pages=60, quality="economy"):
+    """PDF in, Document out (Document.to_markdown() and Document.to_json()).
+
+    quality="economy": Python functions only (plus Azure for scanned pages).
+    quality="standard": the same, then Amazon Nova repairs the weak tables and weak text (see engine/ai.py).
+    """
     started = time.time()
     doc = Document(source=str(path), level="engine")
     if image_store is None:
@@ -82,8 +86,11 @@ def extract_pdf(path, image_store=None, out_dir=None, max_pages=60):
     doc.elements = mdparse.add_key_values([e for e in elements if e.type != "key_value"])
     mdparse.finish_flags(doc.elements)
     doc.number()
+    if quality == "standard":
+        from . import ai
+        ai.repair_document(doc, path)
     doc.timings["total_s"] = round(time.time() - started, 2)
-    doc.cost = {"ocr_pages": ocr_pages}
+    doc.cost["ocr_pages"] = ocr_pages
     return doc
 
 
