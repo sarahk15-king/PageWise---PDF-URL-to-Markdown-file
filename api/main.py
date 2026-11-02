@@ -2915,3 +2915,13 @@ def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
         "tables": table_summaries,
         "warnings": warnings,
     }
+
+# ---- Brief summary of extracted text (Pagewise) ----------------------------------------------------
+@app.post("/summarize")
+def summarize_text(markdown: str = Form(...)):
+    from engine import summary
+
+    try:
+        return summary.summarize(markdown)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"Summary failed: {error}")
