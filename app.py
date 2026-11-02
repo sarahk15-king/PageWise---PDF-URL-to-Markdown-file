@@ -26,16 +26,13 @@ st.markdown(
     .hero p {margin: .5rem 0 0 0; font-size: 1.1rem; opacity: .92; color: white;}
     .steps {display: flex; gap: .8rem; margin-top: 1.1rem; flex-wrap: wrap;}
     .step {background: rgba(255,255,255,.16); border-radius: 999px; padding: .3rem .9rem; font-size: .88rem;}
-    .summary-card {border-left: 5px solid #3b6ea5; background: rgba(59,110,165,.10);
-                   padding: 1rem 1.2rem; border-radius: 10px; margin: .6rem 0 1.2rem 0;}
-    .summary-card h4 {margin: 0 0 .4rem 0;}
     div[data-testid="stMetric"] {background: rgba(128,128,128,.08); padding: .8rem 1rem; border-radius: 12px;}
     .stButton > button, .stDownloadButton > button {border-radius: 10px; font-weight: 600;}
     </style>
     <div class="hero">
       <h1>📄 Pagewise</h1>
-      <p>Turn any PDF or web page into clean Markdown, with its tables and images saved and a check on how sure we are of every page.</p>
-      <div class="steps"><span class="step">1 · Upload</span><span class="step">2 · Extract</span><span class="step">3 · Check the quality</span><span class="step">4 · Download everything</span></div>
+      <p>Turn any PDF or web page into clean Markdown, with its tables and images saved and a side-by-side comparison of tools.</p>
+      <div class="steps"><span class="step">1 · Upload</span><span class="step">2 · Extract</span><span class="step">3 · Compare tools</span><span class="step">4 · Download everything</span></div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -86,16 +83,8 @@ def doc_stats(markdown_text):
     }
 
 
-def quality_text(report):
-    lines = [f"Average confidence: {report['average_confidence']}", f"Pages: {report['pages']}",
-             f"Elements read: {report['elements']}", f"Weak elements: {report['weak_count']}", ""]
-    for w in report["weak"]:
-        lines.append(f"Page {w['page']}, {w['type']}, {w['confidence']}: {w['preview']}")
-    return "\n".join(lines)
-
-
 def zip_everything(result, markdown_text, file_name):
-    """One download: the Markdown, every table as its own CSV, and the quality report when there is one."""
+    """One download: the Markdown and every table as its own CSV."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(file_name, markdown_text)
@@ -103,63 +92,13 @@ def zip_everything(result, markdown_text, file_name):
             out = io.StringIO()
             csv.writer(out).writerows(rows)
             archive.writestr(f"tables/table_{number:02d}.csv", out.getvalue())
-        if result.get("quality_report"):
-            archive.writestr("quality_report.txt", quality_text(result["quality_report"]))
     return buffer.getvalue()
-
-
-def add_summary(result):
-    """Asks the API for a brief summary of the extracted text. A failure never hides the extraction."""
-    try:
-        response = requests.post(
-            f"{API_URL.rstrip('/')}/summarize",
-            data={"markdown": result.get("markdown_text", result.get("markdown_preview", ""))},
-            timeout=120,
-        )
-        response.raise_for_status()
-        result["summary"] = response.json()
-    except Exception as e:
-        try:
-            result["summary_error"] = response.json().get("detail", str(e))
-        except Exception:
-            result["summary_error"] = str(e)
-    return result
-
-
-def show_quality(report):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Average confidence", f"{report['average_confidence']:.0%}")
-    c2.metric("Pages", report["pages"])
-    c3.metric("Elements read", report["elements"])
-    c4.metric("Need a look", report["weak_count"])
-
-    st.caption(
-        "Pagewise scores every heading, paragraph, table and formula it reads. "
-        "A low score does not mean the content is wrong, only that the engine is less sure."
-    )
-    if report.get("by_page"):
-        pages = pd.DataFrame(report["by_page"]).rename(columns={"page": "Page", "average": "Average confidence"})
-        st.markdown("**Confidence by page**")
-        st.bar_chart(pages.set_index("Page")["Average confidence"], height=220)
-    if report["weak"]:
-        st.markdown("**Least sure about**")
-        weak = pd.DataFrame(report["weak"]).rename(
-            columns={"page": "Page", "type": "Type", "confidence": "Confidence", "preview": "What the engine read"}
-        )
-        st.dataframe(weak, use_container_width=True, hide_index=True)
-        if report["weak_count"] > len(report["weak"]):
-            st.caption(f"Showing the {len(report['weak'])} weakest of {report['weak_count']}.")
-    else:
-        st.success("Everything the engine read scored well.")
-    if report.get("ai_repaired"):
-        st.info(f"{report['ai_repaired']} weak elements were repaired with AI.")
 
 
 def show_result(result):
     uploaded = result.get("uploaded", {})
     markdown_text = result.get("markdown_text", result["markdown_preview"])
     file_name = result["s3_key"].rsplit("/", 1)[-1]
-    report = result.get("quality_report")
 
     st.success("Done. Your document is ready.")
 
@@ -168,19 +107,6 @@ def show_result(result):
     c2.metric("Tables found", uploaded.get("table_count", 0))
     c3.metric("Images saved", uploaded.get("image_count", 0))
     c4.metric("Time taken", f"{result['seconds']}s" if result.get("seconds") is not None else "-")
-
-    summary = result.get("summary")
-    if summary:
-        st.markdown(
-            f'<div class="summary-card"><h4>Summary</h4>{summary["summary"]}</div>',
-            unsafe_allow_html=True,
-        )
-        note = f"Written by {summary['model']} in {summary['seconds']}s, cost ${summary['cost_usd']:.4f}."
-        if summary.get("truncated"):
-            note += " The document was long, so only the first part was summarized."
-        st.caption(note)
-    elif result.get("summary_error"):
-        st.info(f"The summary is not available right now: {result['summary_error']}")
 
     for warning in result.get("warnings", []):
         st.warning(warning)
@@ -191,14 +117,10 @@ def show_result(result):
         file_name=file_name.rsplit(".", 1)[0] + ".zip",
         mime="application/zip",
         key=f"zip_{result['s3_key']}",
-        help="The Markdown, every table as a CSV file, and the quality report. Images are saved in S3.",
+        help="The Markdown and every table as a CSV file. Images are saved in S3.",
     )
 
-    names = ["Markdown", f"Tables ({len(result.get('tables', []))})", "Files in S3"]
-    if report:
-        names.insert(1, "Extraction quality")
-    tabs = st.tabs(names)
-    tab_md, tab_tables, tab_files = tabs[0], tabs[-2], tabs[-1]
+    tab_md, tab_tables, tab_files = st.tabs(["Markdown", f"Tables ({len(result.get('tables', []))})", "Files in S3"])
 
     with tab_md:
         st.download_button(
@@ -211,10 +133,6 @@ def show_result(result):
         st.text_area("Markdown preview", markdown_text[:800], height=180)
         if len(markdown_text) > 800:
             st.caption("Showing the first 800 characters. Download the file for everything.")
-
-    if report:
-        with tabs[1]:
-            show_quality(report)
 
     with tab_tables:
         tables = result.get("tables", [])
@@ -257,15 +175,10 @@ tab1, tab_compare, tab2 = st.tabs(["📎 Upload a PDF", "⚖️ Compare tools", 
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
-    left, right = st.columns([2, 1])
-    with left:
-        tool = st.selectbox(
-            "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
-            help="Pagewise engine is our own tool. The others are there to compare.",
-        )
-    with right:
-        want_summary = st.checkbox("Add a brief summary", value=False, key="pdf_summary",
-                                   help="Needs AI access on the server. Off by default.")
+    tool = st.selectbox(
+        "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
+        help="Pagewise engine is our own tool. The others are there to compare.",
+    )
 
     if tool == "azure":
         st.info(
@@ -282,10 +195,7 @@ with tab1:
     if st.button("Process PDF", type="primary", disabled=uploaded_file is None):
         with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
             try:
-                result = run_pdf(uploaded_file, tool)
-                if want_summary:
-                    add_summary(result)
-                st.session_state["pdf_result"] = result
+                st.session_state["pdf_result"] = run_pdf(uploaded_file, tool)
             except Exception as e:
                 st.session_state.pop("pdf_result", None)
                 st.error(f"Error: {e}")
@@ -326,8 +236,6 @@ with tab_compare:
             res = item["result"]
             stats = doc_stats(res.get("markdown_text", ""))
             rows[label] = {"Time (s)": res.get("seconds"), "Characters": res["markdown_length"], **stats}
-            if res.get("quality_report"):
-                rows[label]["Average confidence"] = res["quality_report"]["average_confidence"]
         st.dataframe(pd.DataFrame(rows).fillna("-"), use_container_width=True)
 
         left, right = st.columns(2)
@@ -348,17 +256,12 @@ with tab_compare:
 
 with tab2:
     url = st.text_input("Enter a web page URL", placeholder="https://en.wikipedia.org/wiki/...")
-    left, right = st.columns([2, 1])
-    with left:
-        url_tool = st.selectbox(
-            "Conversion tool",
-            ["beautifulsoup", "azure", "pypdf", "pdfplumber"],
-            format_func=lambda t: {"beautifulsoup": "BeautifulSoup (web pages)", **TOOL_NAMES}[t],
-            key="url_tool",
-        )
-    with right:
-        want_url_summary = st.checkbox("Add a brief summary", value=False, key="url_summary",
-                                       help="Needs AI access on the server. Off by default.")
+    url_tool = st.selectbox(
+        "Conversion tool",
+        ["beautifulsoup", "azure", "pypdf", "pdfplumber"],
+        format_func=lambda t: {"beautifulsoup": "BeautifulSoup (web pages)", **TOOL_NAMES}[t],
+        key="url_tool",
+    )
 
     if url_tool in ("pypdf", "pdfplumber"):
         st.info("pypdf and pdfplumber read PDF files. Use them with a link that points to a PDF.")
@@ -378,10 +281,7 @@ with tab2:
                     f"{API_URL.rstrip('/')}/process-url", data={"url": url, "tool": url_tool}, timeout=300
                 )
                 response.raise_for_status()
-                result = response.json()
-                if want_url_summary:
-                    add_summary(result)
-                st.session_state["url_result"] = result
+                st.session_state["url_result"] = response.json()
             except Exception as e:
                 st.session_state.pop("url_result", None)
                 st.error(f"Error: {error_text(response, e)}")
