@@ -104,9 +104,9 @@ def show_result(result):
             mime="text/markdown",
             key=f"download_{result['s3_key']}",
         )
-        st.text_area("Markdown preview", markdown_text[:3000], height=360)
-        if len(markdown_text) > 3000:
-            st.caption("Showing the first 3,000 characters. Download the file for everything.")
+        st.text_area("Markdown preview", markdown_text[:800], height=180)
+        if len(markdown_text) > 800:
+            st.caption("Showing the first 800 characters. Download the file for everything.")
 
     with tab_tables:
         tables = result.get("tables", [])
