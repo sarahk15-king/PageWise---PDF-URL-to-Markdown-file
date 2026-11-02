@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 import os
 import re
 import zipfile
@@ -81,8 +82,21 @@ def doc_stats(markdown_text):
     }
 
 
-def zip_everything(result, markdown_text, file_name):
-    """One download: the Markdown and every table as its own CSV."""
+def fetch_images(keys):
+    """The extracted images as {file name: bytes}, read through the API (the bucket is private)."""
+    if not keys:
+        return {}
+    try:
+        response = requests.post(f"{API_URL.rstrip('/')}/image-files", data={"keys": json.dumps(keys)}, timeout=120)
+        response.raise_for_status()
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            return {name: archive.read(name) for name in archive.namelist()}
+    except Exception:
+        return {}
+
+
+def zip_everything(result, markdown_text, file_name, images=None):
+    """One download: the Markdown, every table as its own CSV, and the extracted images."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(file_name, markdown_text)
@@ -90,6 +104,8 @@ def zip_everything(result, markdown_text, file_name):
             out = io.StringIO()
             csv.writer(out).writerows(rows)
             archive.writestr(f"tables/table_{number:02d}.csv", out.getvalue())
+        for name, data in (images or {}).items():
+            archive.writestr(f"images/{name}", data)
     return buffer.getvalue()
 
 
@@ -109,13 +125,22 @@ def show_result(result):
     for warning in result.get("warnings", []):
         st.warning(warning)
 
+    image_keys = uploaded.get("image_keys", [])
+    cache_key = f"images_{result['s3_key']}"
+    if image_keys and cache_key not in st.session_state:
+        with st.spinner("Getting the images ready for download..."):
+            st.session_state[cache_key] = fetch_images(image_keys)
+    images = st.session_state.get(cache_key, {})
+    if image_keys and not images:
+        st.caption("The images could not be added to the zip right now. They are still saved in S3.")
+
     st.download_button(
         "⬇ Download everything (.zip)",
-        data=zip_everything(result, markdown_text, file_name),
+        data=zip_everything(result, markdown_text, file_name, images),
         file_name=file_name.rsplit(".", 1)[0] + ".zip",
         mime="application/zip",
         key=f"zip_{result['s3_key']}",
-        help="The Markdown and every table as a CSV file. Images are saved in S3.",
+        help="The Markdown, every table as a CSV file, and the extracted images.",
     )
 
     tab_md, tab_tables, tab_files = st.tabs(["Markdown", f"Tables ({len(result.get('tables', []))})", "Files in S3"])
