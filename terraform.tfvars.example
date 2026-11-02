@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and change what you need. Never put keys in this file.
+aws_region  = "us-east-1"
+project     = "doc-extract"
+environment = "dev"
+
+# Leave false for the first apply, push the image, then set true and apply again.
+deploy_services = false
+
+# Turn on once Bedrock access works.
+ai_repair_enabled = false
