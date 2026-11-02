@@ -5,3 +5,8 @@ ingestion-pipeline_accessKeys.csv
 outputs/
 __pycache__/
 *.pyc
+# Terraform
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/terraform.tfvars
