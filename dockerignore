@@ -1,0 +1,12 @@
+.env
+.git
+.venv
+data
+docs
+eval
+tests
+infra
+full_space
+docling_space
+*.pdf
+__pycache__
