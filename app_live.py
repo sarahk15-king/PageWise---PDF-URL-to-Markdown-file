@@ -19,7 +19,7 @@ SIZE_NOTE = "On the live app, PDFs up to about 1 MB (around 20 pages) work best.
 ON_LIVE_SERVER = "onrender.com" in API_URL
 LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
 # the choices in the Compare tab: the engine at each quality level, then the other tools
-COMPARE_CHOICES = ["engine:economy", "engine:standard"] + PDF_TOOLS[1:]
+COMPARE_CHOICES = ["engine:economy"] + PDF_TOOLS[1:]
 COMPARE_NAMES = {**TOOL_NAMES, "engine:economy": "Pagewise engine (economy)", "engine:standard": "Pagewise engine (standard)"}
 
 st.set_page_config(page_title="Pagewise", page_icon="📄", layout="wide")
@@ -103,10 +103,12 @@ def fetch_images(keys):
 
 
 def zip_everything(result, markdown_text, file_name, images=None):
-    """One download: the Markdown, every table as its own CSV, and the extracted images."""
+    """One download: the Markdown, the JSON, every table as its own CSV, and the extracted images."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(file_name, markdown_text)
+        if result.get("json_text"):
+            archive.writestr(file_name.rsplit(".", 1)[0] + ".json", result["json_text"])
         for number, rows in enumerate(tables_from_markdown(markdown_text), start=1):
             out = io.StringIO()
             csv.writer(out).writerows(rows)
@@ -137,15 +139,6 @@ def show_result(result):
                  "need AI repair. This is the engine's own confidence score, not a comparison with the PDF.",
         )
 
-    if engine:
-        line = f"Quality level: {LEVEL_NAMES.get(engine['quality'], engine['quality'])}."
-        if engine["quality"] == "standard" and engine.get("ai_skipped"):
-            line += " AI repair was skipped, so this is Economy quality."
-        elif engine["quality"] == "standard":
-            line += (f" AI repaired {engine['ai_repaired']} elements in {engine['ai_calls']} calls, "
-                     f"cost ${engine['ai_cost_usd']:.4f}.")
-        st.caption(line)
-
     for warning in result.get("warnings", []):
         st.warning(warning)
 
@@ -164,10 +157,23 @@ def show_result(result):
         file_name=file_name.rsplit(".", 1)[0] + ".zip",
         mime="application/zip",
         key=f"zip_{result['s3_key']}",
-        help="The Markdown, every table as a CSV file, and the extracted images.",
+        help="The Markdown, the JSON (Pagewise engine), every table as a CSV file, and the extracted images.",
     )
 
-    tab_md, tab_tables, tab_files = st.tabs(["Markdown", f"Tables ({len(result.get('tables', []))})", "Files in S3"])
+    names = ["Markdown"] + (["JSON"] if result.get("json_text") else []) + [f"Tables ({len(result.get('tables', []))})", "Files in S3"]
+    tabs = st.tabs(names)
+    tab_md, tab_tables, tab_files = tabs[0], tabs[-2], tabs[-1]
+    if result.get("json_text"):
+        with tabs[1]:
+            st.download_button(
+                "⬇ Download JSON",
+                data=result["json_text"],
+                file_name=file_name.rsplit(".", 1)[0] + ".json",
+                mime="application/json",
+                key=f"json_{result['s3_key']}",
+            )
+            st.caption("Every element with its type, page, reading order, confidence and how it was produced.")
+            st.text_area("JSON preview", result["json_text"][:800], height=180)
 
     with tab_md:
         st.download_button(
@@ -232,16 +238,7 @@ with tab1:
         "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
         help="Pagewise engine is our own tool. The others are there to compare.",
     )
-    quality = None
-    if tool == "engine":
-        quality = st.radio(
-            "Quality level", ["economy", "standard"], horizontal=True, format_func=lambda q: LEVEL_NAMES[q],
-            help="Economy is fastest and costs nothing extra. Standard also repairs weak tables and formulas with AI, "
-                 "which is slower and has a small cost per page.",
-        )
-        st.caption(
-            "Economy: our own functions only. Standard: economy plus AI repair of the parts the engine is least sure about."
-        )
+    quality = "economy" if tool == "engine" else None
 
     if tool == "azure":
         st.info(
@@ -275,7 +272,7 @@ with tab_compare:
     with a:
         tool_a = st.selectbox("Tool A", COMPARE_CHOICES, index=0, format_func=lambda t: COMPARE_NAMES[t], key="tool_a")
     with b:
-        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=2, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
+        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=1, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
     if tool_a == tool_b:
         st.caption("Pick two different tools to compare.")
 
