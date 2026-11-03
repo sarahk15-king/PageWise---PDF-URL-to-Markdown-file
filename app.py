@@ -14,6 +14,10 @@ import streamlit as st
 API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
 TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract", "engine": "Pagewise engine"}
 PDF_TOOLS = ["engine", "markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"]
+LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
+# the choices in the Compare tab: the engine at each quality level, then the other tools
+COMPARE_CHOICES = ["engine:economy", "engine:standard"] + PDF_TOOLS[1:]
+COMPARE_NAMES = {**TOOL_NAMES, "engine:economy": "Pagewise engine (economy)", "engine:standard": "Pagewise engine (standard)"}
 
 st.set_page_config(page_title="Pagewise", page_icon="📄", layout="wide")
 
@@ -122,6 +126,14 @@ def show_result(result):
     c3.metric("Images saved", uploaded.get("image_count", 0))
     c4.metric("Time taken", f"{result['seconds']}s" if result.get("seconds") is not None else "-")
 
+    engine = result.get("engine")
+    if engine:
+        line = f"Quality level: {LEVEL_NAMES.get(engine['quality'], engine['quality'])}."
+        if engine["quality"] == "standard":
+            line += (f" AI repaired {engine['ai_repaired']} elements in {engine['ai_calls']} calls, "
+                     f"cost ${engine['ai_cost_usd']:.4f}.")
+        st.caption(line)
+
     for warning in result.get("warnings", []):
         st.warning(warning)
 
@@ -176,14 +188,18 @@ def show_result(result):
         st.json(uploaded)
 
 
-def run_pdf(file, tool):
-    """Sends one PDF to the API with one tool. Returns the result, or raises with a readable message."""
+def run_pdf(file, tool, quality=None):
+    """Sends one PDF to the API with one tool. Returns the result, or raises with a readable message.
+
+    A tool written as "engine:standard" means the Pagewise engine at that quality level."""
+    if ":" in tool:
+        tool, quality = tool.split(":", 1)
     response = None
     try:
         response = requests.post(
             f"{API_URL.rstrip('/')}/process-pdf",
             files={"file": (file.name, file.getvalue(), "application/pdf")},
-            data={"tool": tool},
+            data={"tool": tool, "quality": quality or ""},
             timeout=600,
         )
         response.raise_for_status()
@@ -202,6 +218,16 @@ with tab1:
         "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
         help="Pagewise engine is our own tool. The others are there to compare.",
     )
+    quality = None
+    if tool == "engine":
+        quality = st.radio(
+            "Quality level", ["economy", "standard"], horizontal=True, format_func=lambda q: LEVEL_NAMES[q],
+            help="Economy is fastest and costs nothing extra. Standard also repairs weak tables and formulas with AI, "
+                 "which is slower and has a small cost per page.",
+        )
+        st.caption(
+            "Economy: our own functions only. Standard: economy plus AI repair of the parts the engine is least sure about."
+        )
 
     if tool == "azure":
         st.info(
@@ -218,7 +244,7 @@ with tab1:
     if st.button("Process PDF", type="primary", disabled=uploaded_file is None):
         with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
             try:
-                st.session_state["pdf_result"] = run_pdf(uploaded_file, tool)
+                st.session_state["pdf_result"] = run_pdf(uploaded_file, tool, quality)
             except Exception as e:
                 st.session_state.pop("pdf_result", None)
                 st.error(f"Error: {e}")
@@ -231,9 +257,9 @@ with tab_compare:
     compare_file = st.file_uploader("Choose a PDF", type=["pdf"], key="compare_file")
     a, b = st.columns(2)
     with a:
-        tool_a = st.selectbox("Tool A", PDF_TOOLS, index=0, format_func=lambda t: TOOL_NAMES[t], key="tool_a")
+        tool_a = st.selectbox("Tool A", COMPARE_CHOICES, index=0, format_func=lambda t: COMPARE_NAMES[t], key="tool_a")
     with b:
-        tool_b = st.selectbox("Tool B", PDF_TOOLS, index=1, format_func=lambda t: TOOL_NAMES[t], key="tool_b")
+        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=2, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
     if tool_a == tool_b:
         st.caption("Pick two different tools to compare.")
 
@@ -252,7 +278,7 @@ with tab_compare:
         rows = {}
         for key in ("a", "b"):
             item = outcome[key]
-            label = TOOL_NAMES[item["tool"]]
+            label = COMPARE_NAMES[item["tool"]]
             if "error" in item:
                 rows[label] = {"Result": f"Failed: {item['error']}"}
                 continue
@@ -265,7 +291,7 @@ with tab_compare:
         for column, key in ((left, "a"), (right, "b")):
             item = outcome[key]
             with column:
-                st.markdown(f"**{TOOL_NAMES[item['tool']]}**")
+                st.markdown(f"**{COMPARE_NAMES[item['tool']]}**")
                 if "error" in item:
                     st.error(item["error"])
                 else:
