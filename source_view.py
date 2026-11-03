@@ -7,6 +7,7 @@ elements of that page on the right.
 
 Used by app.py. Needs pdfplumber to draw the page; without it the app shows a short note instead.
 """
+import base64
 import io
 import json
 import re
@@ -116,7 +117,12 @@ def render(pdf_bytes, json_text, key="source_view"):
         st.markdown("**Source page**")
         try:
             image, marked, weak = draw_page(pdf_bytes, page_number, on_page, limit)
-            st.image(image, use_container_width=True)
+            # embedded in the page itself: Streamlit's temporary image files can vanish between reruns
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85)
+            encoded = base64.b64encode(buffer.getvalue()).decode()
+            st.markdown(f'<img src="data:image/jpeg;base64,{encoded}" style="width:100%;border:1px solid #8884">',
+                        unsafe_allow_html=True)
             repaired = sum("ai_repaired" in e.get("flags", []) for e in on_page)
             st.caption(f"Amber: {weak} below {limit:.2f}. Blue: {repaired} repaired by AI." if (weak or repaired)
                        else f"No element on this page scores below {limit:.2f}.")
