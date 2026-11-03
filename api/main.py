@@ -2764,7 +2764,17 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     seconds = round(time.time() - started, 2)
     engine_info = getattr(_engine_local, "info", None) if tool == "engine" else None
     if engine_info:
-        warnings = list(warnings) + engine_info.pop("warnings", [])
+        engine_warnings = engine_info.pop("warnings", [])
+        skipped = [w for w in engine_warnings
+                   if w.startswith(("AI repair was asked for", "AI repair could not start", "AI repair stopped"))]
+        engine_warnings = [w for w in engine_warnings if w not in skipped]
+        engine_info["ai_skipped"] = bool(skipped)
+        if skipped:
+            engine_warnings.append(
+                "AI repair was skipped. The Bedrock keys it needs are temporary, and they have expired or are not "
+                "available on this server right now, so this result is Economy quality."
+            )
+        warnings = list(warnings) + engine_warnings
     if tool == "markitdown":
         converted = fix_markdown_tables(converted, table_rows)
     markdown_text = place_images(converted, image_places)
