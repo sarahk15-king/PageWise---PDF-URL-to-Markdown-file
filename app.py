@@ -160,9 +160,18 @@ def show_result(result):
         help="The Markdown, the JSON (Pagewise engine), every table as a CSV file, and the extracted images.",
     )
 
-    names = ["Markdown"] + (["JSON"] if result.get("json_text") else []) + [f"Tables ({len(result.get('tables', []))})", "Files in S3"]
+    pdf_bytes = st.session_state.get("pdf_bytes") if result.get("json_text") else None
+    names = (["Markdown"] + (["JSON"] if result.get("json_text") else []) + (["Source vs output"] if pdf_bytes else [])
+             + [f"Tables ({len(result.get('tables', []))})", "Files in S3"])
     tabs = st.tabs(names)
     tab_md, tab_tables, tab_files = tabs[0], tabs[-2], tabs[-1]
+    if pdf_bytes:
+        with tabs[2]:
+            try:
+                import source_view
+                source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}")
+            except ImportError:
+                st.caption("The side-by-side view needs source_view.py next to app.py.")
     if result.get("json_text"):
         with tabs[1]:
             st.download_button(
@@ -255,6 +264,7 @@ with tab1:
     if st.button("Process PDF", type="primary", disabled=uploaded_file is None):
         with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
             try:
+                st.session_state["pdf_bytes"] = uploaded_file.getvalue()
                 st.session_state["pdf_result"] = run_pdf(uploaded_file, tool, quality)
             except Exception as e:
                 st.session_state.pop("pdf_result", None)
