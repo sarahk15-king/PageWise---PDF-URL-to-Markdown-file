@@ -2160,6 +2160,44 @@ def convert_with_engine(file_path, quality=None):
     return doc.to_markdown()
 
 
+def add_image_elements(engine_json, image_keys):
+    """Puts each saved image into the JSON element list, in reading order, next to its caption.
+
+    The engine's own image elements are dropped (the API saves the pictures itself), so they are rebuilt here from
+    the saved files: page number from the file name, the caption from the "Figure N:" line on that page. The
+    confidence is a rule like the engine's other scores: 0.9 when the figure sits above a caption, else 0.7."""
+    elements = engine_json.get("elements", [])
+    by_page = {}
+    for key in image_keys or []:
+        found = re.search(r"/page(\d+)_(figure|img)(\d+)(_[a-z])?\.png$", key)
+        if found and not found.group(4):  # the (a), (b), (c) panels are part of their figure
+            by_page.setdefault(int(found.group(1)), []).append(key)
+    caption = re.compile(r"^(Figure|Fig\.)\s*\d+\s*[:.]", re.IGNORECASE)
+    new = []
+    for page, keys in sorted(by_page.items()):
+        captions = [i for i, e in enumerate(elements)
+                    if e.get("page") == page and e.get("type") == "text" and caption.match(e.get("content", ""))]
+        for n, key in enumerate(keys):
+            has_caption = n < len(captions)
+            new.append((captions[n] if has_caption else None, page, {
+                "type": "image", "page": page,
+                "content": elements[captions[n]]["content"] if has_caption else "",
+                "confidence": 0.9 if has_caption else 0.7,
+                "source": "figure finder", "flags": [] if has_caption else ["no_caption"],
+                "data": {"key": key}, "id": f"img{len(new) + 1}", "in_markdown": True,
+            }))
+    for where, page, element in sorted(new, key=lambda t: -(t[0] if t[0] is not None else
+            max([i for i, e in enumerate(elements) if e.get("page") == page] or [len(elements) - 1]) + 0.5)):
+        index = where if where is not None else max([i for i, e in enumerate(elements) if e.get("page") == page] or [len(elements) - 1]) + 1
+        elements.insert(int(index), element)
+    stats = engine_json.setdefault("stats", {})
+    stats["elements"] = len(elements)
+    if new:
+        scores = [e["confidence"] for _, _, e in new]
+        stats.setdefault("by_type", {})["image"] = {"count": len(new), "average_confidence": round(sum(scores) / len(scores), 2)}
+    return engine_json
+
+
 def convert_pdf(file_path, tool, quality=None):
     if tool == "docling":
         text = convert_with_docling(file_path)
@@ -2828,6 +2866,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     json_text = None
     engine_json = getattr(_engine_local, "json", None) if tool == "engine" else None
     if engine_json is not None:
+        engine_json = add_image_elements(engine_json, uploaded.get("image_keys", []))
         engine_json["images"] = uploaded.get("image_keys", [])
         json_text = json.dumps(engine_json, ensure_ascii=False, indent=2)
         json_key = f"processed/json/engine/api-uploads/{doc_name}.json"
