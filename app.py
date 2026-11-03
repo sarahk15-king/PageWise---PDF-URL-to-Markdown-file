@@ -120,13 +120,20 @@ def show_result(result):
 
     st.success("Done. Your document is ready.")
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Characters extracted", f"{result['markdown_length']:,}")
-    c2.metric("Tables found", uploaded.get("table_count", 0))
-    c3.metric("Images saved", uploaded.get("image_count", 0))
-    c4.metric("Time taken", f"{result['seconds']}s" if result.get("seconds") is not None else "-")
-
     engine = result.get("engine")
+    cards = st.columns(5 if engine else 4)
+    cards[0].metric("Characters extracted", f"{result['markdown_length']:,}")
+    cards[1].metric("Tables found", uploaded.get("table_count", 0))
+    cards[2].metric("Images saved", uploaded.get("image_count", 0))
+    cards[3].metric("Time taken", f"{result['seconds']}s" if result.get("seconds") is not None else "-")
+    if engine:
+        cards[4].metric(
+            "Handled without AI", f"{engine['share_without_ai']:.1f}%",
+            help=f"{engine['elements'] - engine['weak_before_ai']} of {engine['elements']} elements "
+                 "(headings, paragraphs, tables, formulas) were read with enough confidence that they did not "
+                 "need AI repair. This is the engine's own confidence score, not a comparison with the PDF.",
+        )
+
     if engine:
         line = f"Quality level: {LEVEL_NAMES.get(engine['quality'], engine['quality'])}."
         if engine["quality"] == "standard" and engine.get("ai_skipped"):
