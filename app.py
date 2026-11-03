@@ -129,7 +129,9 @@ def show_result(result):
     engine = result.get("engine")
     if engine:
         line = f"Quality level: {LEVEL_NAMES.get(engine['quality'], engine['quality'])}."
-        if engine["quality"] == "standard":
+        if engine["quality"] == "standard" and engine.get("ai_skipped"):
+            line += " AI repair was skipped, so this is Economy quality."
+        elif engine["quality"] == "standard":
             line += (f" AI repaired {engine['ai_repaired']} elements in {engine['ai_calls']} calls, "
                      f"cost ${engine['ai_cost_usd']:.4f}.")
         st.caption(line)
