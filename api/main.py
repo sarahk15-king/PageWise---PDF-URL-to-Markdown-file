@@ -2132,8 +2132,18 @@ def convert_with_engine(file_path, quality=None):
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
+    # How much the engine handled on its own: every element that did not score weak before any AI repair.
+    shown = [e for e in doc.elements if e.in_markdown]
+    weak_before = [
+        e for e in shown
+        if e.data.get("score_before", e.confidence) < (0.8 if e.type == "table" else 0.6)
+        and "ocr" not in e.flags and not e.data.get("scanned")
+    ]
     _engine_local.info = {
         "quality": quality,
+        "elements": len(shown),
+        "weak_before_ai": len(weak_before),
+        "share_without_ai": round(100 * (1 - len(weak_before) / max(len(shown), 1)), 1),
         "ai_calls": doc.cost.get("ai_calls", 0),
         "ai_repaired": sum(1 for e in doc.elements if "ai_repaired" in e.flags),
         "ai_input_tokens": doc.cost.get("ai_input_tokens", 0),
