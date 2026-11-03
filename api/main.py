@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 import unicodedata
 from datetime import date
@@ -2114,19 +2115,36 @@ def order_docling_like_reader(text, reader):
     return "\n\n".join(blocks)
 
 
-def convert_with_engine(file_path):
-    """Our own engine: typed elements with confidence scores, merged in reading order into Markdown."""
+_engine_local = threading.local()   # what the engine reported for the request handled in this thread
+QUALITY_LEVELS = ("economy", "standard")
+
+
+def convert_with_engine(file_path, quality=None):
+    """Our own engine: typed elements with confidence scores, merged in reading order into Markdown.
+
+    quality = economy: Python functions only. standard: plus Amazon Nova repair of weak tables and formulas
+    (needs AI_REPAIR_ENABLED=true and Bedrock access where the API runs). When the caller sends no level,
+    the ENGINE_QUALITY setting decides (default economy).
+    """
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
 
+    quality = (quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower()
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
-    # economy = Python functions only; standard = plus Amazon Nova repair of weak tables and text (needs AI_REPAIR_ENABLED=true)
-    quality = os.getenv("ENGINE_QUALITY", "economy").strip().lower()
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
+    _engine_local.info = {
+        "quality": quality,
+        "ai_calls": doc.cost.get("ai_calls", 0),
+        "ai_repaired": sum(1 for e in doc.elements if "ai_repaired" in e.flags),
+        "ai_input_tokens": doc.cost.get("ai_input_tokens", 0),
+        "ai_output_tokens": doc.cost.get("ai_output_tokens", 0),
+        "ai_cost_usd": doc.cost.get("ai_cost_usd", 0.0),
+        "warnings": list(doc.warnings),
+    }
     return doc.to_markdown()
 
 
-def convert_pdf(file_path, tool):
+def convert_pdf(file_path, tool, quality=None):
     if tool == "docling":
         text = convert_with_docling(file_path)
         # Docling leaves "<!-- image -->" where a picture was; the real image links are placed separately
@@ -2148,7 +2166,7 @@ def convert_pdf(file_path, tool):
     elif tool == "textract":
         return convert_with_textract(file_path)
     elif tool == "engine":
-        return convert_with_engine(file_path)
+        return convert_with_engine(file_path, quality)
     else:
         raise ValueError("tool must be one of: " + ", ".join(PDF_TOOLS))
 
@@ -2701,7 +2719,7 @@ def root():
     return {"status": "ok", "message": "Ingestion pipeline API is running"}
 
 
-def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
+def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     """Upload a PDF, extract its parts and convert it to Markdown. Used for uploads and PDF links."""
     doc_name = safe_name(Path(filename).stem)
     today = date.today().isoformat()
@@ -2735,14 +2753,18 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         warnings.append(f"Text, table and image extraction failed: {e}")
 
     # 3. Whole document as Markdown, with links to the images saved in S3
+    _engine_local.info = None
     started = time.time()
     try:
-        converted = convert_pdf(tmp_path, tool)
+        converted = convert_pdf(tmp_path, tool, quality)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
     seconds = round(time.time() - started, 2)
+    engine_info = getattr(_engine_local, "info", None) if tool == "engine" else None
+    if engine_info:
+        warnings = list(warnings) + engine_info.pop("warnings", [])
     if tool == "markitdown":
         converted = fix_markdown_tables(converted, table_rows)
     markdown_text = place_images(converted, image_places)
@@ -2766,19 +2788,24 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None):
         "tables": table_summaries,
         "warnings": warnings,
         "seconds": seconds,
+        "quality": engine_info["quality"] if engine_info else None,
+        "engine": engine_info,
     }
 
 
 @app.post("/process-pdf")
-def process_pdf(file: UploadFile = File(...), tool: str = Form("docling")):
+def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quality: str = Form("")):
     if tool not in PDF_TOOLS:
         raise HTTPException(status_code=400, detail="tool must be one of: " + ", ".join(PDF_TOOLS))
+    quality = quality.strip().lower()
+    if quality and quality not in QUALITY_LEVELS:
+        raise HTTPException(status_code=400, detail="quality must be one of: " + ", ".join(QUALITY_LEVELS))
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
     try:
-        return run_pdf_pipeline(tmp_path, file.filename, tool)
+        return run_pdf_pipeline(tmp_path, file.filename, tool, quality=quality or None)
     finally:
         tmp_path.unlink(missing_ok=True)
 
