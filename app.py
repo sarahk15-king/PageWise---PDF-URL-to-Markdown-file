@@ -14,6 +14,9 @@ import streamlit as st
 API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
 TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract", "engine": "Pagewise engine"}
 PDF_TOOLS = ["engine", "markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"]
+# The live server is small. This is the size that has been tested there; change the text if you test larger files.
+SIZE_NOTE = "On the live app, PDFs up to about 1 MB (around 20 pages) work best. Larger files may not finish."
+ON_LIVE_SERVER = "onrender.com" in API_URL
 LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
 # the choices in the Compare tab: the engine at each quality level, then the other tools
 COMPARE_CHOICES = ["engine:economy", "engine:standard"] + PDF_TOOLS[1:]
@@ -223,6 +226,8 @@ tab1, tab_compare, tab2 = st.tabs(["📎 Upload a PDF", "⚖️ Compare tools", 
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
+    if ON_LIVE_SERVER:
+        st.caption(SIZE_NOTE)
     tool = st.selectbox(
         "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
         help="Pagewise engine is our own tool. The others are there to compare.",
@@ -264,6 +269,8 @@ with tab1:
 with tab_compare:
     st.write("Run two tools on the same PDF and see what each one found.")
     compare_file = st.file_uploader("Choose a PDF", type=["pdf"], key="compare_file")
+    if ON_LIVE_SERVER:
+        st.caption(SIZE_NOTE)
     a, b = st.columns(2)
     with a:
         tool_a = st.selectbox("Tool A", COMPARE_CHOICES, index=0, format_func=lambda t: COMPARE_NAMES[t], key="tool_a")
