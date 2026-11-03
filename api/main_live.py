@@ -2128,7 +2128,7 @@ def convert_with_engine(file_path, quality=None):
     """
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
 
-    quality = (quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower()
+    quality = "economy"  # live server: no Bedrock keys here, so AI repair is not offered
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
@@ -2151,6 +2151,12 @@ def convert_with_engine(file_path, quality=None):
         "ai_cost_usd": doc.cost.get("ai_cost_usd", 0.0),
         "warnings": list(doc.warnings),
     }
+    # the same elements as structured JSON: type, page, text, confidence and how each was produced
+    try:
+        raw = doc.to_json()
+        _engine_local.json = raw if isinstance(raw, dict) else json.loads(raw)
+    except Exception:
+        _engine_local.json = None
     return doc.to_markdown()
 
 
@@ -2331,6 +2337,19 @@ def find_figure_regions(page):
         line for line in page.extract_text_lines()
         if FIGURE_CAPTION.match(line["text"].strip())
     ]
+    # In two-column papers a caption can start in the right column, in the same text row as
+    # left-column text, so the row does not begin with "Figure N:". Find those by their words.
+    for w in page.extract_words():
+        if w["x0"] > 0.4 * page.width and FIGURE_CAPTION.match(w["text"]):
+            if not any(abs(c["top"] - w["top"]) < 3 and c["x0"] <= w["x0"] + 1 for c in captions if "col" not in c):
+                captions.append({"top": w["top"], "text": w["text"], "x0": w["x0"], "col": (w["x0"] - 12, page.bbox[2])})
+    # a left caption that shares its text row with a right-column caption only owns the left column
+    for c in captions:
+        if "col" in c:
+            continue
+        for r in captions:
+            if "col" in r and abs(r["top"] - c["top"]) < 40 and r["col"][0] > page.width * 0.3 and c["x0"] < r["col"][0]:
+                c["col"] = (page.bbox[0], r["col"][0] - 3)
     if not captions:
         return []
 
@@ -2350,6 +2369,8 @@ def find_figure_regions(page):
     regions = []
     for caption in captions:
         above = [b for b in boxes if b[3] <= caption["top"] + 2]
+        if "col" in caption:  # a caption inside one column: only the drawing in that column
+            above = [b for b in above if b[0] >= caption["col"][0] - 2 and b[2] <= caption["col"][1] + 2]
         candidates = [
             c for c in merge_boxes(above, gap=20)
             if caption["top"] - 80 <= c[3] <= caption["top"] + 3
@@ -2368,12 +2389,15 @@ def find_figure_regions(page):
                 x1, bottom = max(x1, w["x1"]), max(bottom, w["bottom"])
 
         pad = 6
-        regions.append((
+        found = (
             max(x0 - pad, page.bbox[0]),
             max(top - pad, page.bbox[1]),
             min(x1 + pad, page.bbox[2]),
             min(bottom + pad, caption["top"] - 1),
-        ))
+        )
+        if not any(abs(found[0] - r[0]) < 8 and abs(found[1] - r[1]) < 8 and abs(found[2] - r[2]) < 8 and abs(found[3] - r[3]) < 8
+                   for r in regions):
+            regions.append(found)
     return regions
 
 
@@ -2659,6 +2683,11 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 width, height = box[2] - box[0], box[3] - box[1]
                 if height < 60 and width > 3 * height:
                     continue  # a short, wide strip is an equation printed as a picture, not an image
+                # an "image" that mostly covers ordinary page text is not a picture (text drawn as a layer)
+                words_in = [w for w in page.extract_words()
+                            if box[0] <= (w["x0"] + w["x1"]) / 2 <= box[2] and box[1] <= (w["top"] + w["bottom"]) / 2 <= box[3]]
+                if len(words_in) >= 3 and (img["bottom"] > page.bbox[3] + 5 or img["x1"] > page.bbox[2] + 5):
+                    continue
                 cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
                 inside_figure = any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures)
                 if not inside_figure:  # pictures inside a saved figure are already part of it
@@ -2764,6 +2793,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
 
     # 3. Whole document as Markdown, with links to the images saved in S3
     _engine_local.info = None
+    _engine_local.json = None
     started = time.time()
     try:
         converted = convert_pdf(tmp_path, tool, quality)
@@ -2795,6 +2825,16 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     markdown_key = upload_result(doc_name, tool, markdown_text)
     uploaded["markdown"] = markdown_key
 
+    json_text = None
+    engine_json = getattr(_engine_local, "json", None) if tool == "engine" else None
+    if engine_json is not None:
+        engine_json["images"] = uploaded.get("image_keys", [])
+        json_text = json.dumps(engine_json, ensure_ascii=False, indent=2)
+        json_key = f"processed/json/engine/api-uploads/{doc_name}.json"
+        put_object(json_key, json_text.encode("utf-8"), "application/json",
+                   {"tool": "engine", "source": "api-upload", "type": "json", "document": doc_name})
+        uploaded["json"] = json_key
+
     return {
         **(extra or {}),
         "filename": filename,
@@ -2803,6 +2843,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
         "s3_url": f"s3://{BUCKET}/{markdown_key}",
         "markdown_preview": markdown_text[:1000],
         "markdown_text": markdown_text,
+        "json_text": json_text,
         "markdown_length": len(markdown_text),
         "uploaded": uploaded,
         "tables": table_summaries,
