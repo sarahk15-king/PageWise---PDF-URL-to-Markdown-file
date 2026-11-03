@@ -31,6 +31,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# the product API: /v1/keys, /v1/jobs, /v1/usage (see api/products.py)
+try:
+    from .products import router as products_router
+except ImportError:  # started from inside the api folder
+    from products import router as products_router
+app.include_router(products_router)
+
 session = boto3.Session(
     aws_access_key_id=os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key=os.getenv("AWS_SECRET_ACCESS_KEY"),
