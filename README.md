@@ -42,16 +42,3 @@ flowchart TD
 ```
 
 Weak means a table below 0.8 or text/formula below 0.6. An AI answer is kept only if the table score rises or the formula is valid LaTeX that renders.
-
-## System architecture
-
-```mermaid
-flowchart LR
-    U[App or customer] -->|PDF + API key| API[FastAPI]
-    API -->|job id| U
-    API --> Q[(Queue)]
-    Q --> W[Worker]
-    W --> E[Engine]
-    E --> R[(Results)]
-    R --> API
-```
