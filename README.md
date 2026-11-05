@@ -52,4 +52,6 @@ flowchart LR
     API --> Q[(Queue)]
     Q --> W[Worker]
     W --> E[Engine]
-    E -->
+    E --> R[(Results)]
+    R --> API
+```
