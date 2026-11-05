@@ -17,6 +17,7 @@ Pagewise turns a PDF into Markdown, JSON and image files. It reads the PDF with 
 - Source vs output view: amber marks low confidence, blue marks AI-repaired
 - Cost and time cards, a Compare tools tab, and a Download-all zip
 - API with keys, jobs, results and usage; queue and worker so big files never time out
+- In Standard, the app shows how many elements went to AI, how many were fixed, how many were rejected, and the AI cost
 
 ## Engine architecture
 
@@ -41,4 +42,11 @@ flowchart TD
     KEEP --> OUT
 ```
 
-Weak means a table below 0.8 or text/formula below 0.6. An AI answer is kept only if the table score rises or the formula is valid LaTeX that renders.
+Weak means a table below 0.8 or text/formula below 0.6. An AI answer is kept only if the table score rises or the formula is valid LaTeX that renders. A second AI call then compares the answer with the page, and a wrong answer is rejected.
+
+## What works where
+
+| Capability | Live app (Render + Streamlit Cloud) | On my laptop |
+|---|---|---|
+| Economy extraction | Yes | Yes |
+| Scanned pages through Azure | Yes, if the Azure key
