@@ -2135,7 +2135,7 @@ def convert_with_engine(file_path, quality=None):
     """
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
 
-    quality = "economy"  # live server: no Bedrock keys here, so AI repair is not offered
+    quality = (quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower()
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
@@ -2153,6 +2153,10 @@ def convert_with_engine(file_path, quality=None):
         "share_without_ai": round(100 * (1 - len(weak_before) / max(len(shown), 1)), 1),
         "ai_calls": doc.cost.get("ai_calls", 0),
         "ai_repaired": sum(1 for e in doc.elements if "ai_repaired" in e.flags),
+        "ai_sent": len(doc.cost.get("repairs", [])),
+        "ai_retried": doc.cost.get("ai_retried", 0),
+        "ai_fixed_on_retry": doc.cost.get("ai_fixed_on_retry", 0),
+        "ai_rejected": sum(1 for e in doc.elements if "ai_rejected" in e.flags or "ai_check_failed" in e.flags),
         "ai_input_tokens": doc.cost.get("ai_input_tokens", 0),
         "ai_output_tokens": doc.cost.get("ai_output_tokens", 0),
         "ai_cost_usd": doc.cost.get("ai_cost_usd", 0.0),
@@ -2568,7 +2572,7 @@ def split_panels(page, box):
     return [(letter, (edges[i], top, edges[i + 1], bottom)) for i, (_, letter, _) in enumerate(labels)]
 
 
-def find_caption_tables(page, max_rule_gap=70):
+def find_caption_tables(page, max_rule_gap=100):
     """Find tables that have no ruled grid, using their "Table N:" caption and horizontal rules.
 
     Papers usually draw only a few horizontal lines (top, header, bottom) and put the caption
@@ -2590,7 +2594,7 @@ def find_caption_tables(page, max_rule_gap=70):
     for i, caption in enumerate(captions):
         limit = captions[i + 1]["top"] if i + 1 < len(captions) else page.height
         below = [r for r in rules if caption["bottom"] - 6 <= r["top"] < limit - 2]
-        if not below or below[0]["top"] - caption["bottom"] > 45:
+        if not below or below[0]["top"] - caption["bottom"] > 90:
             continue
         group = [below[0]]
         for rule in below[1:]:
@@ -2654,13 +2658,14 @@ def extract_page_tables(page, figures):
             "text_x_tolerance": 3,
         })
         rows = clean_rows(rows or [])
-        if looks_like_table(box, rows, figures):
+        # found from its caption and rules, so wide tables with many empty cells are kept
+        if looks_like_table(box, rows, figures, min_fill=0.15):
             found.append(rows)
             boxes.append(box)
     return found
 
 
-def looks_like_table(bbox, rows, figures):
+def looks_like_table(bbox, rows, figures, min_fill=0.5):
     """Reject boxes that pdfplumber found but that are not real tables.
 
     A real table has at least two rows and two columns with most cells filled in, and it does
@@ -2673,7 +2678,7 @@ def looks_like_table(bbox, rows, figures):
         return False
     cells = [cell for row in rows for cell in row]
     filled = sum(1 for cell in cells if cell and cell.strip())
-    if filled < 4 or filled / len(cells) < 0.5:
+    if filled < 4 or filled / len(cells) < min_fill:
         return False
     cx = (bbox[0] + bbox[2]) / 2
     cy = (bbox[1] + bbox[3]) / 2
