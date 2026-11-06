@@ -48,6 +48,16 @@ def rows_from_words(page, box, gap=6):
     return rows if len(rows) >= 2 and len(widths) == 1 and min(widths) >= 2 else []
 
 
+def caption_table_ok(rows, box, figures):
+    """A table found from its caption and rules is already well placed, so only check that it has some
+    cells filled. Wide tables with merged headers (many empty cells) are kept."""
+    cells = [c for r in rows for c in r]
+    cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    inside_figure = any(f[0] <= cx <= f[2] and f[1] <= cy <= f[3] for f in figures)
+    return (len(rows) >= 2 and max((len(r) for r in rows), default=0) >= 2
+            and sum(1 for c in cells if c and c.strip()) >= 4 and not inside_figure)
+
+
 def tables_with_boxes(m, page, figures):
     """Like Scope 1's extract_page_tables, but also returns where each table sits on the page."""
     found, boxes = [], []
@@ -66,10 +76,27 @@ def tables_with_boxes(m, page, figures):
         rows = m.clean_rows(rows or [])
         if len(rows) < 2:
             rows = rows_from_words(page, box)
-        if m.looks_like_table(box, rows, figures):
+        if caption_table_ok(rows, box, figures):
             found.append((rows, tuple(box)))
             boxes.append(box)
     return found
+
+
+TABLE_CAPTION = re.compile(r"^(Table|TABLE)\s*[\dIVX]+\s*[:.]")
+
+
+def caption_anchors(page_elements):
+    """The element each table should go after: the last line of every "Table N:" caption.
+    A caption that runs onto the next line (no full stop yet) is followed to its end."""
+    anchors = []
+    for i, e in enumerate(page_elements):
+        if e.type in ("text", "header", "heading") and TABLE_CAPTION.match(e.content.strip()):
+            j = i
+            while (j + 1 < len(page_elements) and j - i < 2 and page_elements[j + 1].type == "text"
+                   and page_elements[j].content.strip()[-1:] not in (".", "?", "!")):
+                j += 1
+            anchors.append(page_elements[j])
+    return anchors
 
 
 def figure_images(m, page, figures, page_no):
@@ -146,14 +173,13 @@ def extract_pdf_elements(path, image_store, warnings, max_pages=60):
                 markdown = " ".join(w["text"] for w in words)
             page_elements = mdparse.blocks_to_elements(markdown, n, "reader")
 
-            # tables: after the caption "Table N", or at the end of the page
-            for rows, box in tables:
+            # tables: after the caption "Table N:", or at the end of the page
+            anchors = caption_anchors(page_elements)
+            for k, (rows, box) in enumerate(sorted(tables, key=lambda t: t[1][1])):
                 el = Element("table", n, mdparse.table_markdown(rows), conf.table_confidence(rows), "pdfplumber",
                              data={"rows": rows, "box": [round(v, 1) for v in box]})
-                at = next((i for i, e in enumerate(page_elements)
-                           if e.type == "text" and re.match(r"^(Table|TABLE)\s*[\dIVX]+", e.content)), None)
-                if at is not None:
-                    page_elements.insert(at + 1, el)
+                if k < len(anchors) and anchors[k] in page_elements:
+                    page_elements.insert(page_elements.index(anchors[k]) + 1, el)
                 else:
                     page_elements.append(el)
 
