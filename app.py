@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
@@ -279,6 +279,8 @@ def run_pdf_with_status(file, tool, quality=None):
     message if the job fails."""
     box = st.status("Starting...", expanded=True)
     started = time.time()
+    started_iso = datetime.now(timezone.utc).isoformat()
+    seen = {}   # when each stage was first seen, so this session can show its own history
     job_id = uuid.uuid4().hex[:12]
     where = "live" if ON_LIVE_SERVER else "local"
     box.write(f"**Uploaded:** {file.name} ({len(file.getvalue()) / 1_000_000:.1f} MB)")
@@ -295,7 +297,10 @@ def run_pdf_with_status(file, tool, quality=None):
     def fetch_steps():
         try:
             reply = requests.get(f"{API_URL.rstrip('/')}/progress/{job_id}", timeout=5)
-            return [s["text"] for s in reply.json().get("steps", [])]
+            texts = [s["text"] for s in reply.json().get("steps", [])]
+            for text in texts:
+                seen.setdefault(text, datetime.now(timezone.utc).isoformat())
+            return texts
         except Exception:
             return []
 
@@ -315,12 +320,22 @@ def run_pdf_with_status(file, tool, quality=None):
         time.sleep(1)
     worker.join()
     steps = fetch_steps() or steps
+    def remember(status, seconds, error=None):
+        runs_here = st.session_state.setdefault("session_runs", [])
+        runs_here.insert(0, {
+            "run_id": job_id, "filename": file.name, "tool": tool, "quality": quality, "started_at": started_iso,
+            "status": status, "seconds": seconds, "error": error, "summary": {},
+            "steps": [{"at": seen[t], "text": t} for t in steps if t in seen],
+        })
+
     if "error" in outcome:
+        remember("failed", None, str(outcome["error"]))
         draw(steps, running=False)
         box.update(label="The job failed", state="error")
         raise outcome["error"]
 
     result = outcome["result"]
+    remember("done", result.get("seconds") if result.get("seconds") is not None else round(time.time() - started, 1))
     uploaded = result.get("uploaded", {})
     engine = result.get("engine")
     draw([t for t in steps if t != "Done"], running=False)
@@ -540,11 +555,17 @@ with tab_history:
     st.caption("✅ done   ⬜ not done   ➖ not used for this tool or quality level. AI summary shows ✅ once you click Summarize with AI.")
     if ON_LIVE_SERVER:
         st.caption("This history is kept in a small file on the live server, so it is cleared when the server restarts.")
-    runs = fetch_runs(API_URL)
-    if runs is None:
-        st.info("The job history is not available. Update the API (api/main.py) to the latest version and try again.")
-    elif not runs:
-        st.info("No runs yet. Process a PDF and it will appear here.")
+    api_runs = fetch_runs(API_URL)
+    ids = {r["run_id"] for r in (api_runs or [])}
+    here = [r for r in st.session_state.get("session_runs", []) if r["run_id"] not in ids]
+    runs = sorted(here + (api_runs or []), key=lambda r: r["started_at"], reverse=True)
+    if api_runs is None and runs:
+        st.caption("The API has no saved history yet, so this shows the runs from this browser session only.")
+    if not runs:
+        if api_runs is None:
+            st.info("The job history is not available. Update the API (api/main.py) to the latest version and try again.")
+        else:
+            st.info("No runs yet. Process a PDF and it will appear here.")
     else:
         rows = []
         for run in runs:
