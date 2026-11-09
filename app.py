@@ -3,6 +3,9 @@ import io
 import json
 import os
 import re
+import threading
+import time
+import uuid
 import zipfile
 
 import pandas as pd
@@ -15,7 +18,9 @@ API_URL = os.getenv("API_URL", "https://ingestion-pipeline-api.onrender.com")
 TOOL_NAMES = {"markitdown": "MarkItDown", "pypdf": "pypdf", "pdfplumber": "pdfplumber", "azure": "Azure Document Intelligence", "docling": "Docling", "textract": "Amazon Textract", "engine": "Pagewise engine"}
 PDF_TOOLS = ["engine", "markitdown", "pypdf", "pdfplumber", "azure", "docling", "textract"]
 # The live server is small. This is the size that has been tested there; change the text if you test larger files.
-SIZE_NOTE = "On the live app, PDFs up to about 1 MB (around 20 pages) work best. Larger files may not finish."
+SIZE_NOTE = ("Pagewise accepts PDFs up to 25 MB and 60 pages. This live app runs on a free server with limited memory, "
+             "so PDFs with fewer than 20 pages work best and longer files may not finish. "
+             "For bigger files, run Pagewise locally.")
 ON_LIVE_SERVER = "onrender.com" in API_URL
 LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
 # the choices in the Compare tab: the engine at each quality level, then the other tools
@@ -196,6 +201,37 @@ def show_result(result):
         if len(markdown_text) > 800:
             st.caption("Showing the first 800 characters. Download the file for everything.")
 
+        st.markdown("**AI summary**")
+        summary_key = f"summary_{result['s3_key']}"
+        if ON_LIVE_SERVER:
+            st.caption("The AI summary runs only locally, because it needs valid AWS keys for Amazon Nova.")
+        else:
+            if st.button("Summarize with AI", key=f"summarize_{result['s3_key']}"):
+                with st.spinner("Writing a short summary..."):
+                    try:
+                        reply = requests.post(f"{API_URL.rstrip('/')}/summarize",
+                                              data={"markdown": markdown_text}, timeout=120)
+                        if reply.ok:
+                            st.session_state[summary_key] = reply.json()
+                        else:
+                            try:
+                                detail = reply.json().get("detail", reply.text)
+                            except ValueError:
+                                detail = reply.text
+                            st.session_state[summary_key] = {"error": detail}
+                    except requests.RequestException as error:
+                        st.session_state[summary_key] = {"error": f"Could not reach the API: {error}"}
+            saved = st.session_state.get(summary_key)
+            if saved and saved.get("error"):
+                st.error(saved["error"])
+            elif saved:
+                st.info(saved["summary"])
+                note = (f"{saved['model']} · {saved['input_tokens']:,} tokens in, {saved['output_tokens']:,} out · "
+                        f"${saved['cost_usd']:.5f} · {saved['seconds']}s")
+                if saved.get("truncated"):
+                    note += " · the document was long, so only the first part was summarized"
+                st.caption(note)
+
     with tab_tables:
         tables = result.get("tables", [])
         if not tables:
@@ -215,7 +251,7 @@ def show_result(result):
         st.json(uploaded)
 
 
-def run_pdf(file, tool, quality=None):
+def run_pdf(file, tool, quality=None, progress_id=""):
     """Sends one PDF to the API with one tool. Returns the result, or raises with a readable message.
 
     A tool written as "engine:standard" means the Pagewise engine at that quality level."""
@@ -226,7 +262,7 @@ def run_pdf(file, tool, quality=None):
         response = requests.post(
             f"{API_URL.rstrip('/')}/process-pdf",
             files={"file": (file.name, file.getvalue(), "application/pdf")},
-            data={"tool": tool, "quality": quality or ""},
+            data={"tool": tool, "quality": quality or "", "progress_id": progress_id},
             timeout=600,
         )
         response.raise_for_status()
@@ -234,6 +270,74 @@ def run_pdf(file, tool, quality=None):
     except Exception as e:
         raise RuntimeError(error_text(response, e))
 
+
+def run_pdf_with_status(file, tool, quality=None):
+    """Runs run_pdf in the background and shows each stage of the job live while it loads, from the upload
+    until the converted output is ready. The API reports its stages at /progress/<id>. Raises with a readable
+    message if the job fails."""
+    box = st.status("Starting...", expanded=True)
+    started = time.time()
+    job_id = uuid.uuid4().hex[:12]
+    where = "live" if ON_LIVE_SERVER else "local"
+    box.write(f"**Uploaded:** {file.name} ({len(file.getvalue()) / 1_000_000:.1f} MB)")
+    box.write(f"**Sent** to the {where} API")
+    stages = box.empty()
+    outcome = {}
+
+    def work():
+        try:
+            outcome["result"] = run_pdf(file, tool, quality, progress_id=job_id)
+        except Exception as error:
+            outcome["error"] = error
+
+    def fetch_steps():
+        try:
+            reply = requests.get(f"{API_URL.rstrip('/')}/progress/{job_id}", timeout=5)
+            return [s["text"] for s in reply.json().get("steps", [])]
+        except Exception:
+            return []
+
+    def draw(steps, running):
+        lines = [f"✅ {text}" for text in steps[:-1]] if running else [f"✅ {text}" for text in steps]
+        if running:
+            lines.append(f"⏳ {steps[-1] if steps else 'Waiting for the API to start the job'}...")
+        stages.markdown("\n\n".join(lines))
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    steps = []
+    while worker.is_alive():
+        steps = fetch_steps() or steps
+        draw(steps, running=True)
+        box.update(label=f"Processing... {int(time.time() - started)} s")
+        time.sleep(1)
+    worker.join()
+    steps = fetch_steps() or steps
+    if "error" in outcome:
+        draw(steps, running=False)
+        box.update(label="The job failed", state="error")
+        raise outcome["error"]
+
+    result = outcome["result"]
+    uploaded = result.get("uploaded", {})
+    engine = result.get("engine")
+    draw([t for t in steps if t != "Done"], running=False)
+    box.write(
+        f"**Extracted:** {result['markdown_length']:,} characters, {uploaded.get('table_count', 0)} tables, "
+        f"{uploaded.get('image_count', 0)} images"
+    )
+    if engine and engine["quality"] == "standard":
+        if engine.get("ai_skipped"):
+            box.write("**AI repair:** skipped")
+        else:
+            box.write(
+                f"**AI repair:** {engine.get('ai_sent', 0)} elements sent, {engine['ai_repaired']} fixed, "
+                f"{engine.get('ai_rejected', 0)} rejected, cost ${engine['ai_cost_usd']:.4f}"
+            )
+    total = result["seconds"] if result.get("seconds") is not None else round(time.time() - started, 1)
+    box.write(f"**Done** in {total} s. Saved to S3: `{result['s3_key']}`")
+    box.update(label=f"Done in {total} s", state="complete", expanded=True)
+    return result
 
 # ---- tabs ------------------------------------------------------------------------------------------
 
@@ -262,13 +366,12 @@ with tab1:
         )
 
     if st.button("Process PDF", type="primary", disabled=uploaded_file is None):
-        with st.spinner(f"Processing with {TOOL_NAMES[tool]}..."):
-            try:
-                st.session_state["pdf_bytes"] = uploaded_file.getvalue()
-                st.session_state["pdf_result"] = run_pdf(uploaded_file, tool, quality)
-            except Exception as e:
-                st.session_state.pop("pdf_result", None)
-                st.error(f"Error: {e}")
+        try:
+            st.session_state["pdf_bytes"] = uploaded_file.getvalue()
+            st.session_state["pdf_result"] = run_pdf_with_status(uploaded_file, tool, quality)
+        except Exception as e:
+            st.session_state.pop("pdf_result", None)
+            st.error(f"Error: {e}")
 
     if "pdf_result" in st.session_state:
         show_result(st.session_state["pdf_result"])
