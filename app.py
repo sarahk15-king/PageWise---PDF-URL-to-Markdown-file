@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 import zipfile
+from datetime import datetime
 
 import pandas as pd
 import requests
@@ -144,6 +145,7 @@ def show_result(result):
                  "need AI repair. This is the engine's own confidence score, not a comparison with the PDF.",
         )
 
+
     for warning in result.get("warnings", []):
         st.warning(warning)
 
@@ -210,7 +212,7 @@ def show_result(result):
                 with st.spinner("Writing a short summary..."):
                     try:
                         reply = requests.post(f"{API_URL.rstrip('/')}/summarize",
-                                              data={"markdown": markdown_text}, timeout=120)
+                                              data={"markdown": markdown_text, "run_id": result.get("run_id", "")}, timeout=120)
                         if reply.ok:
                             st.session_state[summary_key] = reply.json()
                         else:
@@ -339,9 +341,43 @@ def run_pdf_with_status(file, tool, quality=None):
     box.update(label=f"Done in {total} s", state="complete", expanded=True)
     return result
 
+def eastern(iso_time, with_date=True):
+    """Turns a saved UTC time into Eastern time (EST in winter, EDT in summer) for display."""
+    try:
+        moment = datetime.fromisoformat(iso_time)
+    except (TypeError, ValueError):
+        return iso_time or ""
+    try:
+        from zoneinfo import ZoneInfo
+        moment = moment.astimezone(ZoneInfo("America/New_York"))
+    except Exception:
+        moment = moment.astimezone()  # no time zone data on this computer: use its own clock
+    return moment.strftime("%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S")
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_runs(api_url, limit=50):
+    """The latest runs from the API's job history, or None when the API has no history route."""
+    try:
+        reply = requests.get(f"{api_url.rstrip('/')}/runs", params={"limit": limit}, timeout=30)
+        reply.raise_for_status()
+        return reply.json()["runs"]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_run_steps(api_url, run_id):
+    try:
+        reply = requests.get(f"{api_url.rstrip('/')}/progress/{run_id}", timeout=30)
+        return reply.json().get("steps", [])
+    except Exception:
+        return []
+
+
 # ---- tabs ------------------------------------------------------------------------------------------
 
-tab1, tab_compare, tab2 = st.tabs(["📎 Upload a PDF", "⚖️ Compare tools", "🔗 Use a web link"])
+tab1, tab_compare, tab2, tab_history = st.tabs(["📎 Upload a PDF", "⚖️ Compare tools", "🔗 Use a web link", "🕘 Job history"])
 
 with tab1:
     uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
@@ -466,3 +502,73 @@ with tab2:
 
 st.divider()
 st.caption("Pagewise · PDFs and web pages in, clean Markdown out.")
+
+# The steps a PDF job goes through, in order: (column name, how the saved step text begins, only for the engine?)
+JOB_STEPS = [
+    ("Saved PDF", "Saving the original PDF", False),
+    ("Tables + images", "Finding tables and images", False),
+    ("Converted", "Converting the PDF to Markdown", False),
+    ("Read pages", "Reading the text, tables and figures", True),
+    ("Scored", "Putting the elements in reading order", True),
+    ("AI repair", "Repairing weak tables and formulas", True),
+    ("Saved result", "Saving the Markdown and JSON", False),
+    ("AI summary", "Writing the AI summary", False),
+]
+
+
+def step_marks(run):
+    """For one run: a list of (column name, mark, full step text or None, time) for every step of the job.
+    ✅ done, ⬜ not done, ➖ not used for this tool or quality level."""
+    saved = run.get("steps") or []
+    is_engine = run["tool"] == "engine"
+    marks = []
+    for name, prefix, engine_only in JOB_STEPS:
+        found = next((s for s in saved if s["text"].startswith(prefix)), None)
+        unused = (engine_only and not is_engine) or (name == "AI repair" and run["quality"] != "standard") \
+            or (name == "AI summary" and ON_LIVE_SERVER)
+        if found:
+            marks.append((name, "✅", found["text"], found["at"]))
+        elif unused:
+            marks.append((name, "➖", None, None))
+        else:
+            marks.append((name, "⬜", None, None))
+    return marks
+
+
+with tab_history:
+    st.write("Every PDF run, newest first, and which steps of the job were done.")
+    st.caption("✅ done   ⬜ not done   ➖ not used for this tool or quality level. AI summary shows ✅ once you click Summarize with AI.")
+    if ON_LIVE_SERVER:
+        st.caption("This history is kept in a small file on the live server, so it is cleared when the server restarts.")
+    runs = fetch_runs(API_URL)
+    if runs is None:
+        st.info("The job history is not available. Update the API (api/main.py) to the latest version and try again.")
+    elif not runs:
+        st.info("No runs yet. Process a PDF and it will appear here.")
+    else:
+        rows = []
+        for run in runs:
+            row = {
+                "Started (ET)": eastern(run["started_at"]),
+                "File": run["filename"],
+                "Status": run["status"],
+                "Seconds": run["seconds"],
+            }
+            for name, mark, _, _ in step_marks(run):
+                row[name] = mark
+            row["Error"] = run.get("error") or ""
+            rows.append(row)
+        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        labels = {r["run_id"]: f"{eastern(r['started_at'], False)}  {r['filename']}  ({r['status']})" for r in runs}
+        picked = st.selectbox("Show the steps of a run", list(labels), format_func=lambda i: labels[i], key="history_pick")
+        run = next(r for r in runs if r["run_id"] == picked)
+        for name, mark, text, at in step_marks(run):
+            if mark == "✅":
+                st.markdown(f"✅ {text}  `{eastern(at, False)}`")
+            else:
+                full = next(p for n, p, _ in JOB_STEPS if n == name)
+                st.markdown(f"{mark} {full}" + ("  (not used)" if mark == "➖" else ""))
+        if run["status"] == "failed":
+            st.error(f"The job failed: {run.get('error') or 'unknown error'}")
+        elif run["status"] == "running":
+            st.info("This job is still running.")
