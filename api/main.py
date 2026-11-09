@@ -2122,6 +2122,18 @@ def order_docling_like_reader(text, reader):
     return "\n\n".join(blocks)
 
 
+PROGRESS = {}   # job id -> the stages a PDF job has reached, so the app can show them while it loads
+
+
+def set_step(progress_id, text):
+    """Adds one stage to a job's progress list (the app reads it from /progress/<id>)."""
+    if not progress_id:
+        return
+    if len(PROGRESS) > 100:
+        PROGRESS.pop(next(iter(PROGRESS)), None)
+    PROGRESS.setdefault(progress_id, []).append({"text": text, "at": round(time.time(), 1)})
+
+
 _engine_local = threading.local()   # what the engine reported for the request handled in this thread
 QUALITY_LEVELS = ("economy", "standard")
 
@@ -2135,7 +2147,7 @@ def convert_with_engine(file_path, quality=None):
     """
     from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
 
-    quality = (quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower()
+    quality = "economy"  # live server: no Bedrock keys here, so AI repair is not offered
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
@@ -2808,12 +2820,16 @@ def root():
     return {"status": "ok", "message": "Ingestion pipeline API is running"}
 
 
-def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
+def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progress_id=""):
     """Upload a PDF, extract its parts and convert it to Markdown. Used for uploads and PDF links."""
     doc_name = safe_name(Path(filename).stem)
     today = date.today().isoformat()
 
+    def step(text):
+        set_step(progress_id, text)
+
     # 1. Original PDF
+    step("Saving the original PDF to S3")
     original_key = f"raw/pdf/api-uploads/{today}/{doc_name}.pdf"
     s3.upload_file(
         str(tmp_path),
@@ -2826,6 +2842,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     )
 
     # 2. Text, tables and images as separate files
+    step("Finding tables and images and saving each as its own file")
     uploaded = {"original_pdf": original_key}
     table_summaries = []
     warnings = []
@@ -2845,12 +2862,27 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
     _engine_local.info = None
     _engine_local.json = None
     started = time.time()
+    step(f"Converting the PDF to Markdown with {tool}")
+    if tool == "engine":
+        try:
+            from engine import set_progress_hook
+            set_progress_hook(step)
+        except ImportError:
+            pass
     try:
         converted = convert_pdf(tmp_path, tool, quality)
     except HTTPException:
         raise
     except Exception as e:
+        step("The conversion failed")
         raise HTTPException(status_code=500, detail=f"{tool} could not convert this PDF: {e}")
+    finally:
+        if tool == "engine":
+            try:
+                from engine import set_progress_hook
+                set_progress_hook(None)
+            except ImportError:
+                pass
     seconds = round(time.time() - started, 2)
     engine_info = getattr(_engine_local, "info", None) if tool == "engine" else None
     if engine_info:
@@ -2872,6 +2904,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
         # the page marks were only there to place pictures, and every picture already sits at its own place
         markdown_text = re.sub(r"(?m)^## Page \d+[ \t]*\n+", "", markdown_text)
         markdown_text = re.sub(r"\n*## Extracted images\n.*\Z", "\n", markdown_text, flags=re.S)
+    step("Saving the Markdown and JSON to S3")
     markdown_key = upload_result(doc_name, tool, markdown_text)
     uploaded["markdown"] = markdown_key
 
@@ -2886,6 +2919,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
                    {"tool": "engine", "source": "api-upload", "type": "json", "document": doc_name})
         uploaded["json"] = json_key
 
+    step("Done")
     return {
         **(extra or {}),
         "filename": filename,
@@ -2906,7 +2940,8 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None):
 
 
 @app.post("/process-pdf")
-def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quality: str = Form("")):
+def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quality: str = Form(""),
+                progress_id: str = Form("")):
     if tool not in PDF_TOOLS:
         raise HTTPException(status_code=400, detail="tool must be one of: " + ", ".join(PDF_TOOLS))
     quality = quality.strip().lower()
@@ -2917,9 +2952,15 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quali
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
     try:
-        return run_pdf_pipeline(tmp_path, file.filename, tool, quality=quality or None)
+        return run_pdf_pipeline(tmp_path, file.filename, tool, quality=quality or None, progress_id=progress_id)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+@app.get("/progress/{progress_id}")
+def job_progress(progress_id: str):
+    """The stages a PDF job has reached so far, oldest first. The app asks for this while it waits."""
+    return {"steps": PROGRESS.get(progress_id, [])}
 
 
 @app.post("/process-url")
@@ -3091,3 +3132,21 @@ def image_files(keys: str = Form(...)):
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Could not read the images: {error}")
     return Response(content=data, media_type="application/zip")
+
+
+@app.post("/summarize")
+def summarize_markdown(markdown: str = Form(...)):
+    """A very brief AI summary of the extracted Markdown (Amazon Nova on Bedrock). Local use only."""
+    try:
+        from engine import summary  # imported here so api.main and engine do not import each other at start-up
+    except ImportError as error:
+        raise HTTPException(status_code=500, detail=f"The summary module is missing: {error}")
+    try:
+        return summary.summarize(markdown)
+    except (RuntimeError, ValueError) as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not write the summary. Check that the Bedrock keys are valid: {error}",
+        )
