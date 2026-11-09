@@ -5,11 +5,14 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
 import unicodedata
-from datetime import date
+import uuid
+from contextlib import closing
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -2122,16 +2125,83 @@ def order_docling_like_reader(text, reader):
     return "\n\n".join(blocks)
 
 
-PROGRESS = {}   # job id -> the stages a PDF job has reached, so the app can show them while it loads
+# ---- job history: every PDF run and the stages it went through, saved in a small SQLite file ------------
+# The file sits next to the product API's own database (DATA_DIR, default .pagewise_data). It needs no AWS.
+# On the free Render server its disk is wiped when the service restarts, so the history lasts until then.
+RUNS_DB = Path(os.getenv("DATA_DIR", ".pagewise_data")) / "pagewise_runs.db"
+_runs_lock = threading.Lock()
 
 
-def set_step(progress_id, text):
-    """Adds one stage to a job's progress list (the app reads it from /progress/<id>)."""
-    if not progress_id:
-        return
-    if len(PROGRESS) > 100:
-        PROGRESS.pop(next(iter(PROGRESS)), None)
-    PROGRESS.setdefault(progress_id, []).append({"text": text, "at": round(time.time(), 1)})
+def _runs_connect():
+    RUNS_DB.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(RUNS_DB), timeout=30)
+    db.execute("create table if not exists runs(run_id text primary key, filename text, tool text, quality text, "
+               "started_at text, finished_at text, status text, seconds real, error text, summary text)")
+    db.execute("create table if not exists run_steps(run_id text, at text, text text)")
+    db.execute("create index if not exists steps_by_run on run_steps(run_id)")
+    return db
+
+
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _history(action):
+    """Runs one history write. A problem with the history file must never stop a conversion."""
+    try:
+        with _runs_lock, closing(_runs_connect()) as db, db:
+            return action(db)
+    except Exception as error:
+        print(f"job history could not be saved: {error}")
+        return None
+
+
+def start_run(run_id, filename, tool, quality):
+    if run_id:
+        _history(lambda db: db.execute(
+            "insert or ignore into runs(run_id, filename, tool, quality, started_at, status) values (?,?,?,?,?,?)",
+            (run_id, filename, tool, quality or "", _utc_now(), "running")))
+
+
+def set_step(run_id, text):
+    """Adds one stage to a run (the app reads the list from /progress/<id> while it waits)."""
+    if run_id:
+        _history(lambda db: db.execute("insert into run_steps values (?,?,?)", (run_id, _utc_now(), text)))
+
+
+def finish_run(run_id, status, seconds=None, error=None, summary=None):
+    if run_id:
+        _history(lambda db: db.execute(
+            "update runs set status=?, finished_at=?, seconds=?, error=?, summary=? where run_id=?",
+            (status, _utc_now(), seconds, (error or "")[:300] or None, json.dumps(summary) if summary else None, run_id)))
+
+
+def run_recorded(tmp_path, filename, tool, quality=None, progress_id="", extra=None):
+    """Runs the PDF pipeline and records the run in the job history."""
+    start_run(progress_id, filename, tool, quality)
+    try:
+        result = run_pdf_pipeline(tmp_path, filename, tool, extra=extra, quality=quality, progress_id=progress_id)
+    except HTTPException as error:
+        finish_run(progress_id, "failed", error=str(error.detail))
+        raise
+    except Exception as error:
+        finish_run(progress_id, "failed", error=str(error))
+        raise
+    result["run_id"] = progress_id   # the app sends it back with /summarize so the summary is logged on this run
+    uploaded = result.get("uploaded", {})
+    engine = result.get("engine") or {}
+    try:
+        size_mb = round(Path(tmp_path).stat().st_size / 1_000_000, 2)
+    except OSError:
+        size_mb = None
+    finish_run(progress_id, "done", result.get("seconds"), summary={
+        "size_mb": size_mb, "characters": result.get("markdown_length"), "tables": uploaded.get("table_count", 0),
+        "images": uploaded.get("image_count", 0), "ai_sent": engine.get("ai_sent", 0),
+        "ai_repaired": engine.get("ai_repaired", 0), "ai_rejected": engine.get("ai_rejected", 0),
+        "ai_skipped": bool(engine.get("ai_skipped")), "ai_cost_usd": engine.get("ai_cost_usd", 0.0),
+        "s3_key": result.get("s3_key"),
+    })
+    return result
 
 
 _engine_local = threading.local()   # what the engine reported for the request handled in this thread
@@ -2952,7 +3022,7 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quali
         shutil.copyfileobj(file.file, tmp)
         tmp_path = Path(tmp.name)
     try:
-        return run_pdf_pipeline(tmp_path, file.filename, tool, quality=quality or None, progress_id=progress_id)
+        return run_recorded(tmp_path, file.filename, tool, quality=quality or None, progress_id=progress_id)
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -2960,11 +3030,34 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quali
 @app.get("/progress/{progress_id}")
 def job_progress(progress_id: str):
     """The stages a PDF job has reached so far, oldest first. The app asks for this while it waits."""
-    return {"steps": PROGRESS.get(progress_id, [])}
+    rows = _history(lambda db: db.execute(
+        "select at, text from run_steps where run_id=? order by rowid", (progress_id,)).fetchall()) or []
+    return {"steps": [{"at": at, "text": text} for at, text in rows]}
+
+
+@app.get("/runs")
+def job_history(limit: int = 30):
+    """The latest PDF runs, newest first, with their status, time and result numbers."""
+    rows = _history(lambda db: db.execute(
+        "select run_id, filename, tool, quality, started_at, finished_at, status, seconds, error, summary "
+        "from runs order by started_at desc, rowid desc limit ?", (max(1, min(limit, 200)),)).fetchall()) or []
+    ids = [r[0] for r in rows]
+    steps = {}
+    if ids:
+        marks = ",".join("?" for _ in ids)
+        for run_id, at, text in _history(lambda db: db.execute(
+                f"select run_id, at, text from run_steps where run_id in ({marks}) order by rowid", ids).fetchall()) or []:
+            steps.setdefault(run_id, []).append({"at": at, "text": text})
+    runs = []
+    for run_id, filename, tool, quality, started, finished, status, seconds, error, summary in rows:
+        runs.append({"run_id": run_id, "filename": filename, "tool": tool, "quality": quality, "started_at": started,
+                     "finished_at": finished, "status": status, "seconds": seconds, "error": error,
+                     "summary": json.loads(summary) if summary else {}, "steps": steps.get(run_id, [])})
+    return {"runs": runs}
 
 
 @app.post("/process-url")
-def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
+def process_url(url: str = Form(...), tool: str = Form("beautifulsoup"), progress_id: str = Form("")):
     if tool not in URL_TOOLS:
         raise HTTPException(status_code=400, detail="tool must be one of: " + ", ".join(URL_TOOLS))
     today = date.today().isoformat()
@@ -2992,7 +3085,7 @@ def process_url(url: str = Form(...), tool: str = Form("beautifulsoup")):
             tmp_path = Path(tmp.name)
         try:
             file_name = Path(urlparse(url).path).name or "document.pdf"
-            return run_pdf_pipeline(tmp_path, file_name, tool, extra={"url": url})
+            return run_recorded(tmp_path, file_name, tool, progress_id=progress_id or uuid.uuid4().hex, extra={"url": url})
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -3135,14 +3228,17 @@ def image_files(keys: str = Form(...)):
 
 
 @app.post("/summarize")
-def summarize_markdown(markdown: str = Form(...)):
+def summarize_markdown(markdown: str = Form(...), run_id: str = Form("")):
     """A very brief AI summary of the extracted Markdown (Amazon Nova on Bedrock). Local use only."""
     try:
         from engine import summary  # imported here so api.main and engine do not import each other at start-up
     except ImportError as error:
         raise HTTPException(status_code=500, detail=f"The summary module is missing: {error}")
     try:
-        return summary.summarize(markdown)
+        reply = summary.summarize(markdown)
+        set_step(run_id, f"Writing the AI summary with {reply.get('model', 'Amazon Nova')} "
+                         f"({reply.get('input_tokens', 0):,} tokens in, ${reply.get('cost_usd', 0):.5f})")
+        return reply
     except (RuntimeError, ValueError) as error:
         raise HTTPException(status_code=400, detail=str(error))
     except Exception as error:
