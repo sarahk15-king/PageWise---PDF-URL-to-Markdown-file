@@ -23,7 +23,7 @@ SIZE_NOTE = "Upload a PDF of no more than 20 pages."
 ON_LIVE_SERVER = "onrender.com" in API_URL
 LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
 # the choices in the Compare tab: the engine at each quality level, then the other tools
-COMPARE_CHOICES = ["engine:economy", "engine:standard"] + PDF_TOOLS[1:]
+COMPARE_CHOICES = ["engine:economy"] + PDF_TOOLS[1:]
 COMPARE_NAMES = {**TOOL_NAMES, "engine:economy": "Pagewise engine (economy)", "engine:standard": "Pagewise engine (standard)"}
 
 st.set_page_config(page_title="Pagewise", page_icon="📄", layout="wide")
@@ -143,39 +143,6 @@ def show_result(result):
                  "need AI repair. This is the engine's own confidence score, not a comparison with the PDF.",
         )
 
-    if engine:
-        level = LEVEL_NAMES.get(engine["quality"], engine["quality"])
-        if engine["quality"] == "standard" and engine.get("ai_skipped"):
-            st.markdown(f"#### Quality level: {level}\n\nAI repair was skipped, so this is Economy quality.")
-        elif engine["quality"] == "standard":
-            total = max(engine["elements"], 1)
-            fixed = engine["ai_repaired"]
-            st.markdown(f"#### Quality level: {level}")
-            sent = engine.get("ai_sent", 0)
-            rejected = engine.get("ai_rejected", 0)
-            still_weak = max(engine["weak_before_ai"] - fixed, 0)
-            after_ai = 100 * (1 - still_weak / total)
-            ai_cards = st.columns(5)
-            ai_cards[0].metric("Sent to AI", sent, help="Elements the engine was least sure about")
-            ai_cards[1].metric("Fixed by AI", f"{fixed} of {sent}")
-            ai_cards[2].metric("Rejected", rejected,
-                               help="The AI answer was worse or failed the check, so the original was kept")
-            ai_cards[3].metric(
-                "After AI", f"{after_ai:.1f}%",
-                help=f"{total - still_weak} of {total} elements are now read with enough confidence. "
-                     f"Before AI repair it was {engine['share_without_ai']:.1f}%.",
-            )
-            ai_cards[4].metric("AI cost", f"${engine['ai_cost_usd']:.4f}", help=f"{engine['ai_calls']} AI calls")
-            share = 100 * fixed / sent if sent else 0
-            st.markdown(f"### AI fixed {fixed} of the {sent} elements sent to it ({share:.0f}%).")
-            if engine.get("ai_retried"):
-                st.caption(f"{engine['ai_retried']} elements got a second attempt after the first answer was rejected; "
-                           f"{engine.get('ai_fixed_on_retry', 0)} of them were fixed on the second attempt.")
-            if rejected:
-                st.caption(f"{rejected} AI answers were rejected because they were not better than the original, "
-                           "so the original was kept.")
-        else:
-            st.markdown(f"#### Quality level: {level}")
 
     for warning in result.get("warnings", []):
         st.warning(warning)
@@ -433,16 +400,7 @@ with tab1:
         "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
         help="Pagewise engine is our own tool. The others are there to compare.",
     )
-    quality = None
-    if tool == "engine":
-        quality = st.radio(
-            "Quality level", ["economy", "standard"], horizontal=True, format_func=lambda q: LEVEL_NAMES[q],
-            help="Economy is fastest and costs nothing extra. Standard also repairs weak tables and formulas with AI, "
-                 "which is slower and has a small cost per page.",
-        )
-        st.caption(
-            "Economy: our own functions only. Standard: economy plus AI repair of the parts the engine is least sure about."
-        )
+    quality = "economy" if tool == "engine" else None
 
     if tool == "azure":
         st.info(
@@ -476,7 +434,7 @@ with tab_compare:
     with a:
         tool_a = st.selectbox("Tool A", COMPARE_CHOICES, index=0, format_func=lambda t: COMPARE_NAMES[t], key="tool_a")
     with b:
-        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=2, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
+        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=1, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
     if tool_a == tool_b:
         st.caption("Pick two different tools to compare.")
 
@@ -571,6 +529,14 @@ JOB_STEPS = [
 ]
 
 
+def run_tool_label(run):
+    """The tool a run used, as shown in the Job history. The Pagewise engine also shows its quality level."""
+    name = TOOL_NAMES.get(run.get("tool"), run.get("tool") or "")
+    if run.get("tool") == "engine" and run.get("quality"):
+        name += f" ({LEVEL_NAMES.get(run['quality'], run['quality'])})"
+    return name
+
+
 def step_marks(run):
     """For one run: a list of (column name, mark, full step text or None, time) for every step of the job.
     ✅ done, ⬜ not done, ➖ not used for this tool or quality level."""
@@ -612,6 +578,7 @@ with tab_history:
             row = {
                 "Started (ET)": eastern(run["started_at"]),
                 "File": run["filename"],
+                "Tool": run_tool_label(run),
                 "Status": run["status"],
                 "Seconds": run["seconds"],
             }
@@ -619,7 +586,10 @@ with tab_history:
                 row[name] = mark
             row["Error"] = run.get("error") or ""
             rows.append(row)
-        st.dataframe(pd.DataFrame(rows), hide_index=True)
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True,
+            column_config={"Error": st.column_config.TextColumn("Error", width="large")},
+        )
         labels = {r["run_id"]: f"{eastern(r['started_at'], False)}  {r['filename']}  ({r['status']})" for r in runs}
         picked = st.selectbox("Show the steps of a run", list(labels), format_func=lambda i: labels[i], key="history_pick")
         run = next(r for r in runs if r["run_id"] == picked)
