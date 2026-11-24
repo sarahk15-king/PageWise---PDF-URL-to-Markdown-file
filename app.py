@@ -21,9 +21,11 @@ PDF_TOOLS = ["engine", "markitdown", "pypdf", "pdfplumber", "azure", "docling", 
 # The live server is small. This is the size that has been tested there; change the text if you test larger files.
 SIZE_NOTE = "Upload a PDF of no more than 20 pages."
 ON_LIVE_SERVER = "onrender.com" in API_URL
+# the backend is not on this computer (Lambda, Render): tools that need a big local install, like Docling, are not available there
+RUNS_IN_CLOUD = not any(h in API_URL for h in ("localhost", "127.0.0.1"))
 LEVEL_NAMES = {"economy": "Economy", "standard": "Standard"}
 # the choices in the Compare tab: the engine at each quality level, then the other tools
-COMPARE_CHOICES = ["engine:economy"] + PDF_TOOLS[1:]
+COMPARE_CHOICES = ["engine:economy", "engine:standard"] + PDF_TOOLS[1:]
 COMPARE_NAMES = {**TOOL_NAMES, "engine:economy": "Pagewise engine (economy)", "engine:standard": "Pagewise engine (standard)"}
 
 st.set_page_config(page_title="Pagewise", page_icon="📄", layout="wide")
@@ -93,6 +95,59 @@ def doc_stats(markdown_text):
     }
 
 
+SCORE_FORMULAS = {
+    "text": "smaller of: words found in the PDF / words in the text, characters found in the PDF / characters in the text",
+    "heading": "same as text",
+    "table": "smaller of: rows with the usual column count / all rows, word match with the PDF (F1 of coverage and precision)",
+    "formula": "checks passed / 2 (plain ASCII LaTeX, curly braces balanced)",
+    "image": "smaller of: share of the figure's ink inside the crop, match with the picture in the PDF (correlation)",
+}
+
+
+def show_ai_details(repairs, image_repairs):
+    """Every element that was sent to the AI, with its score before and after and what happened to it."""
+    rows = []
+    for r in repairs:
+        if r["accepted"]:
+            result = "Fixed (the answer scored higher)"
+        elif r.get("ai_check") == "failed":
+            result = "Rejected: the AI check said WRONG" + (f" ({r['ai_check_note']})" if r.get("ai_check_note") else "")
+        elif r["score_after"] <= r["score_before"]:
+            result = "Rejected: the answer did not score higher"
+        else:
+            result = "Rejected"
+        rows.append({"What": r["type"], "Page": r["page"], "Score before": r["score_before"],
+                     "Score after AI": r["score_after"], "Result": result,
+                     "How it is scored": SCORE_FORMULAS.get(r["type"], "")})
+    for r in image_repairs or []:
+        rows.append({"What": f"image {r['name']}", "Page": r["page"], "Score before": r["score_before"],
+                     "Score after AI": r["score_after"],
+                     "Result": "Fixed (re-cropped)" if r["accepted"] else "Kept the original: " + r.get("note", ""),
+                     "How it is scored": SCORE_FORMULAS["image"]})
+    if not rows:
+        return
+    import html
+    cell = "padding:6px 10px;border:1px solid #8884;vertical-align:top;white-space:normal;word-break:break-word"
+    head = "".join(f'<th style="{cell};text-align:left">{html.escape(c)}</th>' for c in rows[0])
+    body = "".join(
+        "<tr>" + "".join(f'<td style="{cell}">{html.escape(str(v))}</td>' for v in row.values()) + "</tr>"
+        for row in rows)
+    box = "white-space:pre-wrap;word-break:break-word;border:1px solid #8884;border-radius:6px;padding:8px;" \
+          "font-family:monospace;font-size:0.85em;margin:0"
+    with st.expander(f"What was sent to the AI ({len(rows)} elements)", expanded=True):
+        # a plain HTML table, so every cell shows its whole text (st.dataframe cuts long cells off)
+        st.markdown(f'<table style="width:100%;border-collapse:collapse;font-size:0.9em"><tr>{head}</tr>{body}</table>',
+                    unsafe_allow_html=True)
+        for r in repairs:
+            if r["accepted"]:
+                st.markdown(f"**Fixed, page {r['page']} ({r['type']}), {r['score_before']} to {r['score_after']}**")
+                left, right = st.columns(2)
+                left.caption("Before")
+                left.markdown(f'<pre style="{box}">{html.escape(r["before"] or "-")}</pre>', unsafe_allow_html=True)
+                right.caption("After the AI")
+                right.markdown(f'<pre style="{box}">{html.escape(r["after"] or "-")}</pre>', unsafe_allow_html=True)
+
+
 def fetch_images(keys):
     """The extracted images as {file name: bytes}, read through the API (the bucket is private)."""
     if not keys:
@@ -137,12 +192,46 @@ def show_result(result):
     cards[3].metric("Time taken", f"{result['seconds']}s" if result.get("seconds") is not None else "-")
     if engine:
         cards[4].metric(
-            "Handled without AI", f"{engine['share_without_ai']:.1f}%",
-            help=f"{engine['elements'] - engine['weak_before_ai']} of {engine['elements']} elements "
-                 "(headings, paragraphs, tables, formulas) were read with enough confidence that they did not "
-                 "need AI repair. This is the engine's own confidence score, not a comparison with the PDF.",
+            "Accuracy", f"{engine.get('match_before_ai', 0):.1f}%",
+            help="Accuracy before any AI repair: the average score of all elements. Each score is the share of the "
+                 "element that the PDF's own words confirm (tables and text), so 98% means 98% of the words "
+                 f"match. {engine['elements'] - engine['weak_before_ai']} of {engine['elements']} elements match completely.",
         )
 
+    if engine:
+        level = LEVEL_NAMES.get(engine["quality"], engine["quality"])
+        if engine["quality"] == "standard" and engine.get("ai_skipped"):
+            st.markdown(f"#### Quality level: {level}\n\nAI repair was skipped, so this is Economy quality.")
+        elif engine["quality"] == "standard":
+            total = max(engine["elements"], 1)
+            fixed = engine["ai_repaired"]
+            st.markdown(f"#### Quality level: {level}")
+            sent = engine.get("ai_sent", 0)
+            rejected = engine.get("ai_rejected", 0)
+            still_weak = max(engine["weak_before_ai"] - fixed, 0)
+            after_ai = 100 * (1 - still_weak / total)
+            ai_cards = st.columns(5)
+            ai_cards[0].metric("Sent to AI", sent, help="Elements the engine was least sure about")
+            ai_cards[1].metric("Fixed by AI", f"{fixed} of {sent}")
+            ai_cards[2].metric("Rejected", rejected,
+                               help="The AI answer was worse or failed the check, so the original was kept")
+            ai_cards[3].metric(
+                "Accuracy after AI", f"{engine.get('match_after_ai', 0):.1f}%",
+                delta=f"{engine.get('match_after_ai', 0) - engine.get('match_before_ai', 0):+.1f} points",
+                help="The same average score, after the AI repair. "
+                     f"{total - still_weak} of {total} elements now match completely.",
+            )
+            ai_cards[4].metric("AI cost", f"${engine['ai_cost_usd']:.4f}", help=f"{engine['ai_calls']} AI calls")
+            st.markdown(f"### AI fixed {fixed} of the {sent} elements sent to it.")
+            if engine.get("ai_retried"):
+                st.caption(f"{engine['ai_retried']} elements got a second attempt after the first answer was rejected; "
+                           f"{engine.get('ai_fixed_on_retry', 0)} of them were fixed on the second attempt.")
+            if rejected:
+                st.caption(f"{rejected} AI answers were rejected because they were not better than the original, "
+                           "so the original was kept.")
+            show_ai_details(engine.get("ai_repairs", []), uploaded.get("image_repairs"))
+        else:
+            st.markdown(f"#### Quality level: {level}")
 
     for warning in result.get("warnings", []):
         st.warning(warning)
@@ -174,7 +263,7 @@ def show_result(result):
         with tabs[2]:
             try:
                 import source_view
-                source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}")
+                source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}", images=images)
             except ImportError:
                 st.caption("The side-by-side view needs source_view.py next to app.py.")
     if result.get("json_text"):
@@ -271,6 +360,15 @@ def run_pdf(file, tool, quality=None, progress_id=""):
         raise RuntimeError(error_text(response, e))
 
 
+def file_size_text(size_bytes):
+    """A file size people can read: bytes, KB or MB, whichever fits."""
+    if size_bytes < 1000:
+        return f"{size_bytes} bytes"
+    if size_bytes < 1_000_000:
+        return f"{size_bytes / 1000:.1f} KB"
+    return f"{size_bytes / 1_000_000:.1f} MB"
+
+
 def run_pdf_with_status(file, tool, quality=None):
     """Runs run_pdf in the background and shows each stage of the job live while it loads, from the upload
     until the converted output is ready. The API reports its stages at /progress/<id>. Raises with a readable
@@ -281,7 +379,7 @@ def run_pdf_with_status(file, tool, quality=None):
     seen = {}   # when each stage was first seen, so this session can show its own history
     job_id = uuid.uuid4().hex[:12]
     where = "live" if ON_LIVE_SERVER else "local"
-    box.write(f"**Uploaded:** {file.name} ({len(file.getvalue()) / 1_000_000:.1f} MB)")
+    box.write(f"**Uploaded:** {file.name} ({file_size_text(len(file.getvalue()))})")
     box.write(f"**Sent** to the {where} API")
     stages = box.empty()
     outcome = {}
@@ -349,6 +447,12 @@ def run_pdf_with_status(file, tool, quality=None):
                 f"**AI repair:** {engine.get('ai_sent', 0)} elements sent, {engine['ai_repaired']} fixed, "
                 f"{engine.get('ai_rejected', 0)} rejected, cost ${engine['ai_cost_usd']:.4f}"
             )
+            if engine.get("ai_model"):
+                box.write(f"**AI model used:** `{engine['ai_model']}`")
+    image_repairs = uploaded.get("image_repairs")
+    if image_repairs is not None:
+        fixed = sum(1 for r in image_repairs if r["accepted"])
+        box.write(f"**AI image repair:** {len(image_repairs)} weak images sent, {fixed} re-cropped")
     total = result["seconds"] if result.get("seconds") is not None else round(time.time() - started, 1)
     box.write(f"**Done** in {total} s. Saved to S3: `{result['s3_key']}`")
     box.update(label=f"Done in {total} s", state="complete", expanded=True)
@@ -400,7 +504,16 @@ with tab1:
         "Conversion tool", PDF_TOOLS, format_func=lambda t: TOOL_NAMES[t],
         help="Pagewise engine is our own tool. The others are there to compare.",
     )
-    quality = "economy" if tool == "engine" else None
+    quality = None
+    if tool == "engine":
+        quality = st.radio(
+            "Quality level", ["economy", "standard"], horizontal=True, format_func=lambda q: LEVEL_NAMES[q],
+            help="Economy is fastest and costs nothing extra. Standard also repairs weak tables and formulas with AI, "
+                 "which is slower and has a small cost per page.",
+        )
+        st.caption(
+            "Economy: our own functions only. Standard: economy plus AI repair of the parts the engine is least sure about."
+        )
 
     if tool == "azure":
         st.info(
@@ -409,10 +522,16 @@ with tab1:
         )
 
     if tool == "docling":
-        st.info(
-            "Docling is slower than the other tools. The first run can take a few minutes while its "
-            "service wakes up, and large PDFs take longer."
-        )
+        if RUNS_IN_CLOUD:
+            st.warning(
+                "Docling does not work in the cloud version. It needs more memory and disk space than AWS Lambda "
+                "allows, so choose another tool here. Docling works when the backend runs on your own computer."
+            )
+        else:
+            st.info(
+                "Docling is slower than the other tools. The first run can take a few minutes while its "
+                "service wakes up, and large PDFs take longer."
+            )
 
     if st.button("Process PDF", type="primary", disabled=uploaded_file is None):
         try:
@@ -434,7 +553,7 @@ with tab_compare:
     with a:
         tool_a = st.selectbox("Tool A", COMPARE_CHOICES, index=0, format_func=lambda t: COMPARE_NAMES[t], key="tool_a")
     with b:
-        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=1, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
+        tool_b = st.selectbox("Tool B", COMPARE_CHOICES, index=2, format_func=lambda t: COMPARE_NAMES[t], key="tool_b")
     if tool_a == tool_b:
         st.caption("Pick two different tools to compare.")
 
@@ -524,6 +643,7 @@ JOB_STEPS = [
     ("Read pages", "Reading the text, tables and figures", True),
     ("Scored", "Putting the elements in reading order", True),
     ("AI repair", "Repairing weak tables and formulas", True),
+    ("AI images", "Repairing weak images with AI", True),
     ("Saved result", "Saving the Markdown and JSON", False),
     ("AI summary", "Writing the AI summary", False),
 ]
@@ -545,7 +665,7 @@ def step_marks(run):
     marks = []
     for name, prefix, engine_only in JOB_STEPS:
         found = next((s for s in saved if s["text"].startswith(prefix)), None)
-        unused = (engine_only and not is_engine) or (name == "AI repair" and run["quality"] != "standard") \
+        unused = (engine_only and not is_engine) or (name in ("AI repair", "AI images") and run["quality"] != "standard") \
             or (name == "AI summary" and ON_LIVE_SERVER)
         if found:
             marks.append((name, "✅", found["text"], found["at"]))
