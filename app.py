@@ -633,7 +633,7 @@ with tab2:
         show_result(st.session_state["url_result"])
 
 st.divider()
-st.caption("Pagewise · PDFs and web pages in, clean Markdown out.")
+st.caption("Pagewise · PDFs and web pages in, clean Markdown out. App version: 24 Nov 2026, with quality levels.")
 
 # The steps a PDF job goes through, in order: (column name, how the saved step text begins, only for the engine?)
 JOB_STEPS = [
