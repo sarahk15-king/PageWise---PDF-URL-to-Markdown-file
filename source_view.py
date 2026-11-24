@@ -93,7 +93,46 @@ def draw_page(pdf_bytes, page_number, elements, limit=None, dpi=100):
     return Image.alpha_composite(image, overlay).convert("RGB"), marked, weak
 
 
-def render(pdf_bytes, json_text, key="source_view"):
+def clickable_image(picture, name, height=260):
+    """The picture with its file name as a link. A click opens the full-size image in a new browser tab.
+    (Browsers block a plain link to inline image data, so the link builds the tab from the image bytes.)"""
+    import streamlit.components.v1 as components
+    encoded = base64.b64encode(picture).decode()
+    components.html(f"""
+<style>body{{margin:0;font-family:sans-serif;font-size:14px}} img{{max-width:100%;max-height:{height - 50}px;border:1px solid #8884;cursor:pointer}}
+a{{color:#1a73e8;text-decoration:underline;cursor:pointer}}</style>
+<div><img id="pic" src="data:image/png;base64,{encoded}"></div>
+<div><a id="lnk">&#128279; {name} (click to open full size)</a></div>
+<script>
+function openFull() {{
+  var bin = atob("{encoded}"), bytes = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  window.open(URL.createObjectURL(new Blob([bytes], {{type: "image/png"}})), "_blank");
+}}
+document.getElementById("lnk").onclick = openFull;
+document.getElementById("pic").onclick = openFull;
+</script>""", height=height)
+
+
+def show_image(e, images, key):
+    """An extracted image on the right side: the saved picture itself, the file name and a full-size view,
+    so it can be checked against the source page on the left."""
+    data = e.get("data") or {}
+    s3_key = data.get("key", "")
+    name = s3_key.rsplit("/", 1)[-1] or data.get("name", "image")
+    picture = (images or {}).get(name)
+    if e.get("content") and not e["content"].startswith("!["):
+        st.caption(e["content"])
+    if picture is None:
+        st.caption(f"Image file: {name} (not loaded here). S3 path: s3://{s3_key}" if s3_key else "[image] " + e.get("content", ""))
+        return
+    clickable_image(picture, name)
+    st.download_button("Download this image", picture, file_name=name, mime="image/png", key=f"{key}_dl_{name}")
+    if s3_key:
+        st.caption(f"Saved in S3 as: {s3_key}")
+
+
+def render(pdf_bytes, json_text, key="source_view", images=None):
     try:
         data = json.loads(json_text)
         elements = data["elements"]
@@ -138,7 +177,7 @@ def render(pdf_bytes, json_text, key="source_view"):
             if e["type"] == "heading":
                 st.markdown("#### " + e["content"])
             elif e["type"] == "image":
-                st.caption("[image] " + e.get("content", ""))
+                show_image(e, images, key)
             elif e["type"] == "table":
                 st.markdown(e["content"])
             else:
