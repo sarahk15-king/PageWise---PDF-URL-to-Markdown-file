@@ -992,6 +992,114 @@ def tx_drop_picture_text(blocks, file_path):
     return [b for b in kept if b is not None]
 
 
+TX_LIST_START = re.compile(r"^(\d{1,2}[.)]|[\u2022\u25aa\u25e6\u25cf\-\u2013])\s+\S")
+TX_CAPTION_START = re.compile(r"^(Table|Figure|Fig\.|Algorithm)\s*\d+", re.IGNORECASE)
+
+
+def tx_merge_paragraphs(blocks):
+    """Textract returns one LINE per printed line. Lines that belong to one paragraph are joined again, using where
+    they sit on the page. A paragraph ends where there is extra space, where the next line is indented or jumps back
+    up (a new column), where a line is much shorter than the others (a "Batch size: 32" style line, a list item, the
+    last line of a paragraph), where a sentence ends on a short line, and at a caption or a list item. Headings,
+    tables and the lines inside tables stay as they are. A word split by a hyphen at a line end is made whole."""
+    by_id = {b["Id"]: b for b in blocks if "Id" in b}
+    table_words = set()
+    for b in blocks:
+        if b.get("BlockType") == "TABLE":
+            for cell in tx_children(b, by_id):
+                for w in tx_children(cell, by_id):
+                    table_words.add(w["Id"])
+    lines = [b for b in blocks if b.get("BlockType") == "LINE" and b.get("Geometry")]
+    if not lines:
+        return blocks
+
+    def box(b):
+        return b["Geometry"]["BoundingBox"]
+
+    heights = sorted(box(b)["Height"] for b in lines)
+    body_height = heights[len(heights) // 2]
+    rights = {}
+    for b in lines:
+        rights.setdefault(b.get("Page", 1), []).append(box(b)["Left"] + box(b)["Width"])
+    edge = {page: sorted(v)[int(len(v) * 0.9)] if len(v) > 4 else max(v) for page, v in rights.items()}
+
+    def standalone(b):
+        words = [w["Id"] for w in tx_children(b, by_id) if w["BlockType"] == "WORD"]
+        if words and any(w in table_words for w in words):
+            return True
+        return bool(tx_heading_level(b.get("Text", "").strip(), box(b)["Height"], body_height))
+
+    def continues(prev, cur):
+        page = prev.get("Page", 1)
+        if page != cur.get("Page", 1):
+            return False
+        pb, cb = box(prev), box(cur)
+        if cb["Top"] < pb["Top"] - 0.002:
+            return False                                   # jumped back up: another column
+        if cb["Top"] - (pb["Top"] + pb["Height"]) > 0.7 * pb["Height"]:
+            return False                                   # extra space between the lines
+        if cb["Left"] - pb["Left"] > 0.012:
+            return False                                   # the next line is indented: a new paragraph
+        text = prev.get("Text", "").strip()
+        nxt = cur.get("Text", "").strip()
+        if TX_CAPTION_START.match(nxt) or TX_LIST_START.match(nxt) or TX_CAPTION_START.match(text) and len(text) < 120:
+            return False                                   # a caption or a list item has its own paragraph
+        right = pb["Left"] + pb["Width"]
+        limit = edge.get(page, 1)
+        if right < limit * 0.8:
+            return False                                   # a much shorter line: it ends its paragraph
+        if right < limit * 0.93 and text.endswith((".", "?", "!", ":")):
+            return False                                   # a sentence ended on a short line
+        return True
+
+    out, para = [], []
+
+    def flush():
+        if not para:
+            return
+        text = para[0].get("Text", "").strip()
+        for nxt in para[1:]:
+            nxt = nxt.get("Text", "").strip()
+            if text.endswith("-") and nxt[:1].islower() and len(text) > 2 and text[-2].isalpha():
+                text = text[:-1] + nxt
+            else:
+                text += " " + nxt
+        merged = dict(para[0])
+        merged["Text"] = text
+        merged["Relationships"] = []
+        out.append(merged)
+        para.clear()
+
+    for b in blocks:
+        if b.get("BlockType") != "LINE" or not b.get("Geometry"):
+            flush()
+            out.append(b)
+        elif standalone(b):
+            flush()
+            out.append(b)
+        elif para and continues(para[-1], b):
+            para.append(b)
+        else:
+            flush()
+            para.append(b)
+    flush()
+    # Joining lines changes which line size is the "usual" one, and the heading finder compares against that size.
+    # Empty lines at the usual size, which print nothing, keep the count the way it was.
+    kept = [b for b in out if b.get("BlockType") == "LINE" and b.get("Geometry")]
+    for _ in range(max(len(lines) - len(kept), 0)):
+        out.append({"BlockType": "LINE", "Text": "", "Page": kept[-1].get("Page", 1), "Relationships": [],
+                    "Geometry": {"BoundingBox": {"Top": 0, "Left": 0, "Width": 0, "Height": body_height}}})
+    return out
+
+
+def tx_join_title_lines(markdown):
+    """A title printed on several lines comes out as several '# ' headings in a row: they become one heading."""
+    joined = re.sub(r"(?m)^# (.+)\n\n# (.+)$", r"# \1 \2", markdown)
+    while joined != markdown:
+        markdown, joined = joined, re.sub(r"(?m)^# (.+)\n\n# (.+)$", r"# \1 \2", joined)
+    return joined
+
+
 TEXTRACT_MAX_WAIT = 300  # seconds to wait for Textract before giving up
 
 
@@ -1032,7 +1140,11 @@ def convert_with_textract(file_path):
         blocks = tx_drop_picture_text(blocks, file_path)
     except Exception:
         pass  # keep all of Textract's lines if the figures cannot be located
-    markdown = tx_textract_to_markdown(blocks, page_marks=True)
+    try:
+        blocks = tx_merge_paragraphs(blocks)   # the lines of one paragraph become one paragraph
+    except Exception:
+        pass  # keep one line per paragraph if the layout lookup fails
+    markdown = tx_join_title_lines(tx_textract_to_markdown(blocks, page_marks=True))
     try:
         # Textract cannot read equations, so the column reader's LaTeX formulas are put in their places
         markdown = recognize_docling_formulas(markdown, file_path)
@@ -2156,24 +2268,96 @@ def _history(action):
         return None
 
 
+# On AWS Lambda each request may run in a different copy of the function, and a copy's disk (/tmp) is private to it.
+# A SQLite file would then lose the stages (the app polls /progress while /process-pdf is still running on
+# another copy) and the history. So when RUNS_TABLE is set, the runs live in a DynamoDB table instead.
+RUNS_TABLE = os.getenv("RUNS_TABLE", "")
+RUNS_TTL_DAYS = 7
+_runs_ddb = []
+
+
+def _ddb_runs():
+    if not _runs_ddb:
+        _runs_ddb.append(session.resource("dynamodb").Table(RUNS_TABLE))
+    return _runs_ddb[0]
+
+
+def _ddb_safely(action):
+    """Same promise as _history: a problem with the history table must never stop a conversion."""
+    try:
+        return action(_ddb_runs())
+    except Exception as error:
+        print(f"job history could not be saved: {error}")
+        return None
+
+
+def _ttl():
+    return int(time.time()) + RUNS_TTL_DAYS * 86400
+
+
+def _plain_number(value):
+    from decimal import Decimal
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    return value
+
+
 def start_run(run_id, filename, tool, quality):
-    if run_id:
-        _history(lambda db: db.execute(
-            "insert or ignore into runs(run_id, filename, tool, quality, started_at, status) values (?,?,?,?,?,?)",
-            (run_id, filename, tool, quality or "", _utc_now(), "running")))
+    if not run_id:
+        return
+    if RUNS_TABLE:
+        def put(table):
+            try:
+                table.put_item(
+                    Item={"run_id": run_id, "filename": filename, "tool": tool, "quality": quality or "",
+                          "started_at": _utc_now(), "status": "running", "steps": [], "expires_at": _ttl()},
+                    ConditionExpression="attribute_not_exists(run_id)")
+            except table.meta.client.exceptions.ConditionalCheckFailedException:
+                pass   # the run was already started: same as SQLite's "insert or ignore"
+        _ddb_safely(put)
+        return
+    _history(lambda db: db.execute(
+        "insert or ignore into runs(run_id, filename, tool, quality, started_at, status) values (?,?,?,?,?,?)",
+        (run_id, filename, tool, quality or "", _utc_now(), "running")))
 
 
 def set_step(run_id, text):
     """Adds one stage to a run (the app reads the list from /progress/<id> while it waits)."""
-    if run_id:
-        _history(lambda db: db.execute("insert into run_steps values (?,?,?)", (run_id, _utc_now(), text)))
+    if not run_id:
+        return
+    if RUNS_TABLE:
+        _ddb_safely(lambda table: table.update_item(
+            Key={"run_id": run_id},
+            UpdateExpression="SET steps = list_append(if_not_exists(steps, :none), :one)",
+            ExpressionAttributeValues={":none": [], ":one": [{"at": _utc_now(), "text": text}]}))
+        return
+    _history(lambda db: db.execute("insert into run_steps values (?,?,?)", (run_id, _utc_now(), text)))
 
 
 def finish_run(run_id, status, seconds=None, error=None, summary=None):
-    if run_id:
-        _history(lambda db: db.execute(
-            "update runs set status=?, finished_at=?, seconds=?, error=?, summary=? where run_id=?",
-            (status, _utc_now(), seconds, (error or "")[:300] or None, json.dumps(summary) if summary else None, run_id)))
+    if not run_id:
+        return
+    if RUNS_TABLE:
+        from decimal import Decimal
+        values = {":s": status, ":f": _utc_now()}
+        expression = "SET #st = :s, finished_at = :f"
+        if seconds is not None:
+            values[":sec"] = Decimal(str(seconds))
+            expression += ", seconds = :sec"
+        if error:
+            values[":e"] = error[:300]
+            expression += ", #er = :e"
+        if summary:
+            values[":sum"] = json.dumps(summary)
+            expression += ", summary = :sum"
+        names = {"#st": "status", "#er": "error"} if error else {"#st": "status"}
+        _ddb_safely(lambda table: table.update_item(
+            Key={"run_id": run_id}, UpdateExpression=expression,
+            ExpressionAttributeNames=names, ExpressionAttributeValues=values))
+        return
+    _history(lambda db: db.execute(
+        "update runs set status=?, finished_at=?, seconds=?, error=?, summary=? where run_id=?",
+        (status, _utc_now(), seconds, (error or "")[:300] or None, json.dumps(summary) if summary else None, run_id)))
 
 
 def run_recorded(tmp_path, filename, tool, quality=None, progress_id="", extra=None):
@@ -2215,9 +2399,10 @@ def convert_with_engine(file_path, quality=None):
     (needs AI_REPAIR_ENABLED=true and Bedrock access where the API runs). When the caller sends no level,
     the ENGINE_QUALITY setting decides (default economy).
     """
-    from engine import extract_pdf  # imported here so api.main and engine do not import each other at start-up
+    from engine import extract_pdf
+    from engine import confidence as conf  # imported here so api.main and engine do not import each other at start-up
 
-    quality = "economy"  # live server: no Bedrock keys here, so AI repair is not offered
+    quality = (quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower()
     # The app already saves every picture to S3 and places its link, so the engine's own image links are dropped
     doc = extract_pdf(file_path, image_store=lambda name, png: "", quality=quality)
     doc.elements = [e for e in doc.elements if e.type != "image"]
@@ -2225,15 +2410,31 @@ def convert_with_engine(file_path, quality=None):
     shown = [e for e in doc.elements if e.in_markdown]
     weak_before = [
         e for e in shown
-        if e.data.get("score_before", e.confidence) < (0.8 if e.type == "table" else 0.6)
+        if e.data.get("score_before", e.confidence) < conf.WEAK
         and "ocr" not in e.flags and not e.data.get("scanned")
     ]
+    # Average match with the PDF: the mean score of the elements (each score is the share of the element that the
+    # PDF's own words confirm), before and after the AI repair. Scanned pages are left out (their score is the OCR's).
+    scored = [e for e in shown if "ocr" not in e.flags and not e.data.get("scanned")]
+    if not scored:   # every page was scanned: use the OCR's own confidence, so the accuracy is not shown as 0
+        scored = [e for e in shown if e.data.get("ocr_confidence") is not None]
+    match_before = sum(e.data.get("score_before", e.confidence) for e in scored) / max(len(scored), 1)
+    match_after = sum(e.confidence for e in scored) / max(len(scored), 1)
     _engine_local.info = {
         "quality": quality,
+        "match_before_ai": round(100 * match_before, 1),
+        "match_after_ai": round(100 * match_after, 1),
         "elements": len(shown),
         "weak_before_ai": len(weak_before),
         "share_without_ai": round(100 * (1 - len(weak_before) / max(len(shown), 1)), 1),
+        "ai_model": doc.cost.get("ai_model", ""),
         "ai_calls": doc.cost.get("ai_calls", 0),
+        "ai_repairs": [
+            {"page": r["page"], "type": r["type"], "accepted": r["accepted"],
+             "score_before": r["score_before"], "score_after": r["score_after"],
+             "ai_check": r.get("ai_check", ""), "ai_check_note": (r.get("ai_check_note") or "")[:400],
+             "before": (r.get("before") or "")[:2000], "after": (r.get("after") or "")[:2000]}
+            for r in doc.cost.get("repairs", [])],
         "ai_repaired": sum(1 for e in doc.elements if "ai_repaired" in e.flags),
         "ai_sent": len(doc.cost.get("repairs", [])),
         "ai_retried": doc.cost.get("ai_retried", 0),
@@ -2253,41 +2454,184 @@ def convert_with_engine(file_path, quality=None):
     return doc.to_markdown()
 
 
-def add_image_elements(engine_json, image_keys):
-    """Puts each saved image into the JSON element list, in reading order, next to its caption.
+def _norm_text(text):
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def _locate_box(words, normed, text):
+    """Where an element's text sits on the page: (x0, top, x1, bottom) of the page words that spell the start of
+    the text, or None. The words are joined and compared with the start of the element, so a PDF whose words are
+    run together still matches."""
+    target = _norm_text(text)
+    if len(target) < 4:
+        return None
+    best, best_len = [], 0
+    for start in range(len(words)):
+        if not normed[start] or not target.startswith(normed[start]):
+            continue
+        joined, used = "", []
+        for k in range(start, len(words)):
+            if not normed[k]:
+                continue
+            if not target.startswith(joined + normed[k]):
+                break
+            joined += normed[k]
+            used.append(k)
+            if len(joined) >= len(target):
+                break
+        if len(joined) > best_len:
+            best, best_len = used, len(joined)
+        if len(joined) >= min(len(target), 60):
+            break
+    if best_len < min(len(target), 12):
+        return None
+    picked = [words[k] for k in best]
+    return (min(w["x0"] for w in picked), min(w["top"] for w in picked),
+            max(w["x1"] for w in picked), max(w["bottom"] for w in picked))
+
+
+def attach_image_anchors(pdf_path, elements, places):
+    """Finds where each image sits among the page's elements, from its position on the page.
+
+    For every image the anchor is the element right below it in the same column (the first one, in reading order,
+    that starts at or below the image's top edge and overlaps it sideways). Elements that lie inside the image
+    (the figure's own labels) are ignored. The image is then put just before its anchor. An image with nothing
+    below it in its column is put after the last element above it. This does not depend on a caption.
+    Sets place["before"] (index of the anchor element, or the index after the last element above) and
+    place["before_text"] (the start of the anchor's text, to find it in the Markdown). Failures leave the
+    place without an anchor, and the caller falls back to the caption."""
+    try:
+        import pdfplumber
+        pages = sorted({pl["page"] for pl in places if pl.get("box")})
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page_no in pages:
+                words = pdf.pages[page_no - 1].extract_words()
+                normed = [_norm_text(w["text"]) for w in words]
+                boxes = {}
+                for i, e in enumerate(elements):
+                    if e.get("page") != page_no or e.get("type") == "image":
+                        continue
+                    box = (e.get("data") or {}).get("box") if e.get("type") == "table" else None
+                    box = tuple(box) if box else _locate_box(words, normed, e.get("content", ""))
+                    if box:
+                        boxes[i] = box
+                for pl in places:
+                    if pl["page"] != page_no or not pl.get("box"):
+                        continue
+                    x0, top, x1, bottom = pl["box"]
+                    width = max(x1 - x0, 1)
+                    below, above = [], []
+                    for i, (ex0, et, ex1, eb) in boxes.items():
+                        cx, cy = (ex0 + ex1) / 2, (et + eb) / 2
+                        if x0 <= cx <= x1 and top <= cy <= bottom:
+                            continue                      # a label inside the figure
+                        overlap = max(0.0, min(x1, ex1) - max(x0, ex0))
+                        if overlap < 0.5 * min(width, max(ex1 - ex0, 1)):
+                            continue                      # another column
+                        (below if et >= top - 2 else above).append(i)
+                    if below:
+                        pl["before"] = min(below)
+                    elif above:
+                        pl["before"] = max(above) + 1
+                    else:
+                        continue
+                # pictures side by side (their vertical ranges overlap by at least half) belong together: they all go
+                # before the earliest anchor of the group
+                row = [pl for pl in places if pl["page"] == page_no and pl.get("box") and "before" in pl]
+                for pl in row:
+                    for other in row:
+                        overlap = min(pl["box"][3], other["box"][3]) - max(pl["box"][1], other["box"][1])
+                        smaller = min(pl["box"][3] - pl["box"][1], other["box"][3] - other["box"][1])
+                        if smaller > 0 and overlap >= 0.5 * smaller and other["before"] < pl["before"]:
+                            pl["before"] = other["before"]
+                for pl in row:
+                    if pl["before"] < len(elements):
+                        pl["before_text"] = ((elements[pl["before"]].get("content") or "").strip().splitlines() or [""])[0][:60]
+    except Exception:
+        pass
+    return places
+
+
+def adopt_side_by_side_labels(places):
+    """A picture without a caption that sits beside a captioned figure (the two halves of one figure, like
+    "(left)" and "(right)") takes that figure's caption label: their vertical ranges overlap by at least half of
+    the smaller one."""
+    for pl in places:
+        if pl.get("label") or not pl.get("box"):
+            continue
+        for other in places:
+            if other is pl or other["page"] != pl["page"] or not other.get("label") or not other.get("box"):
+                continue
+            overlap = min(pl["box"][3], other["box"][3]) - max(pl["box"][1], other["box"][1])
+            smaller = min(pl["box"][3] - pl["box"][1], other["box"][3] - other["box"][1])
+            if smaller > 0 and overlap >= 0.5 * smaller:
+                pl["label"] = other["label"]
+                break
+    return places
+
+
+def add_image_elements(engine_json, image_keys, places=None):
+    """Puts each saved image into the JSON element list, where it sits on the page.
 
     The engine's own image elements are dropped (the API saves the pictures itself), so they are rebuilt here from
-    the saved files: page number from the file name, the caption from the "Figure N:" line on that page. The
-    confidence is a rule like the engine's other scores: 0.9 when the figure sits above a caption, else 0.7."""
+    the saved files. With the image positions (places), an image goes just before the element below it in its
+    column, so two figures side by side both land at the top of the page, and a figure at the bottom lands at the
+    bottom. Without a position it falls back to its caption ("Figure N:"), else the end of its page. The score is
+    the measured image score when there is one (Standard quality), else the old rule: 0.9 with a caption, 0.7
+    without."""
     elements = engine_json.get("elements", [])
-    by_page = {}
-    for key in image_keys or []:
-        found = re.search(r"/page(\d+)_(figure|img)(\d+)(_[a-z])?\.png$", key)
-        if found and not found.group(4):  # the (a), (b), (c) panels are part of their figure
-            by_page.setdefault(int(found.group(1)), []).append(key)
-    caption = re.compile(r"^(Figure|Fig\.)\s*\d+\s*[:.]", re.IGNORECASE)
-    new = []
-    for page, keys in sorted(by_page.items()):
-        captions = [i for i, e in enumerate(elements)
-                    if e.get("page") == page and e.get("type") == "text" and caption.match(e.get("content", ""))]
-        for n, key in enumerate(keys):
-            has_caption = n < len(captions)
-            new.append((captions[n] if has_caption else None, page, {
-                "type": "image", "page": page,
-                "content": elements[captions[n]]["content"] if has_caption else "",
-                "confidence": 0.9 if has_caption else 0.7,
-                "source": "figure finder", "flags": [] if has_caption else ["no_caption"],
-                "data": {"key": key}, "id": f"img{len(new) + 1}", "in_markdown": True,
-            }))
-    for where, page, element in sorted(new, key=lambda t: -(t[0] if t[0] is not None else
-            max([i for i, e in enumerate(elements) if e.get("page") == page] or [len(elements) - 1]) + 0.5)):
-        index = where if where is not None else max([i for i, e in enumerate(elements) if e.get("page") == page] or [len(elements) - 1]) + 1
-        elements.insert(int(index), element)
+    items = []
+    if places:
+        for pl in places:
+            found = re.search(r"/page(\d+)_(figure|img)(\d+)(_[a-z])?\.png$", pl["key"])
+            if found and not found.group(4):  # the (a), (b), (c) panels are part of their figure
+                items.append(dict(pl))
+    else:
+        for key in image_keys or []:
+            found = re.search(r"/page(\d+)_(figure|img)(\d+)(_[a-z])?\.png$", key)
+            if found and not found.group(4):
+                items.append({"key": key, "page": int(found.group(1)), "label": None})
+    caption = re.compile(r"^(Figure|Fig\.)\s*(\d+)\s*[:.]", re.IGNORECASE)
+
+    def caption_index(item):
+        number = (item.get("label") or "").split()[-1:] or [None]
+        for i, e in enumerate(elements):
+            m = caption.match(e.get("content", "")) if e.get("page") == item["page"] and e.get("type") == "text" else None
+            if m and (number[0] is None or m.group(2) == number[0]):
+                return i
+        return None
+
+    def page_end(page):
+        return max([i for i, e in enumerate(elements) if e.get("page") == page] or [len(elements) - 1]) + 1
+
+    placed = []   # (insert before this index, left edge, top, element)
+    for n, item in enumerate(items):
+        cap = caption_index(item) if item.get("label") else None
+        before = item.get("before")
+        if before is None:
+            before = cap if cap is not None else page_end(item["page"])
+        score = item.get("score")
+        if score is None:
+            score = 0.9 if cap is not None else 0.7
+        box = item.get("box") or [0, 0, 0, 0]
+        placed.append((before, box[0], box[1], {
+            "type": "image", "page": item["page"],
+            "content": elements[cap]["content"] if cap is not None else "",
+            "confidence": score,
+            "source": "figure finder", "flags": [] if cap is not None else ["no_caption"],
+            "data": {"key": item["key"], "box": item.get("box")}, "id": f"img{n + 1}", "in_markdown": True,
+        }))
+    result = []
+    for i, e in enumerate(elements):
+        result += [el for b, _, _, el in sorted((x for x in placed if x[0] == i), key=lambda x: (x[1], x[2]))]
+        result.append(e)
+    result += [el for b, _, _, el in sorted((x for x in placed if x[0] >= len(elements)), key=lambda x: (x[0], x[1], x[2]))]
+    engine_json["elements"] = result
     stats = engine_json.setdefault("stats", {})
-    stats["elements"] = len(elements)
-    if new:
-        scores = [e["confidence"] for _, _, e in new]
-        stats.setdefault("by_type", {})["image"] = {"count": len(new), "average_confidence": round(sum(scores) / len(scores), 2)}
+    stats["elements"] = len(result)
+    if placed:
+        scores = [el["confidence"] for _, _, _, el in placed]
+        stats.setdefault("by_type", {})["image"] = {"count": len(placed), "average_confidence": round(sum(scores) / len(scores), 2)}
     return engine_json
 
 
@@ -2353,6 +2697,21 @@ def place_images(markdown_text, places):
                 return start, end
         return None
 
+    inserts = []  # (position, text)
+    by_anchor = {}
+    rest = []
+    for place in places:
+        snippet = place.get("before_text")
+        if snippet and markdown_text.count(snippet) == 1:     # the element right below the image, found in the text
+            start = markdown_text.rfind("\n", 0, markdown_text.index(snippet)) + 1
+            by_anchor.setdefault(start, []).append(place)
+        else:
+            rest.append(place)
+    for start, group in by_anchor.items():
+        group.sort(key=lambda pl: ((pl.get("box") or [0, 0])[0], (pl.get("box") or [0, 0])[1]))
+        inserts.append((start, "\n\n".join(image_link(pl["key"]) for pl in group) + "\n\n"))
+    places = rest
+
     groups = {}  # figure label -> {"page": ..., "keys": [...]}
     loose = []   # images without a caption
     for place in places:
@@ -2362,7 +2721,6 @@ def place_images(markdown_text, places):
         else:
             loose.append(place)
 
-    inserts = []  # (position, text)
     unplaced = []
 
     for label, group in groups.items():
@@ -2769,7 +3127,7 @@ def looks_like_table(bbox, rows, figures, min_fill=0.5):
     return True
 
 
-def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
+def extract_and_upload_pdf_parts(pdf_path, doc_name, today, quality="economy", step=None):
     """Pull text, tables and images out of a PDF and upload each one to S3 on its own."""
     import pdfplumber
 
@@ -2780,6 +3138,20 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
     table_rows = []
     warnings = []
     table_meta = {"source": "api-upload", "document": doc_name, "date": today}
+
+    # Standard quality: every saved picture is scored, and weak ones are sent to the AI to be re-cropped
+    image_repairs = []
+    pending_images = []
+    ai_tokens = {"in": 0, "out": 0}
+    repairer = None
+    if quality == "standard":
+        try:
+            from engine import ai as engine_ai, confidence as conf
+            cfg = engine_ai.settings()
+            if cfg["enabled"]:
+                repairer = (engine_ai, conf, cfg, engine_ai.make_client())
+        except Exception as e:
+            warnings.append(f"AI repair of images could not start: {e}")
 
     with pdfplumber.open(str(pdf_path)) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
@@ -2846,7 +3218,7 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                 continue
             scale = RENDER_DPI / 72
             for name, box, label in to_save:
-                if len(image_keys) >= MAX_IMAGES:
+                if len(pending_images) >= MAX_IMAGES:
                     break
                 try:
                     crop = page_image.crop((
@@ -2855,17 +3227,57 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
                     ))
                     buffer = io.BytesIO()
                     crop.save(buffer, format="PNG")
-                    key = f"assets/images/api-uploads/{doc_name}/{name}.png"
-                    put_object(
-                        key,
-                        buffer.getvalue(),
-                        "image/png",
-                        {"source": "api-upload", "document": doc_name, "date": today, "type": "image"},
-                    )
-                    image_keys.append(key)
-                    image_places.append({"key": key, "page": page_num, "label": label})
+                    png = buffer.getvalue()
+                    score = None
+                    pdf_image = None
+                    if repairer and re.search(r"_(figure\d+|img\d+)$", name):  # whole figures and pictures, not panels
+                        try:
+                            engine_ai, conf, cfg, client = repairer
+                            pdf_image = page.images[int(name.rsplit("_img", 1)[1])] if "_img" in name else None
+                            score = conf.image_confidence(page, box, conf.image_checks(page, box, png, pdf_image))
+                        except Exception as e:
+                            warnings.append(f"Scoring {name} failed: {e}")
+                    # saved after every image is scored, so the AI can be given only the document's worst images
+                    pending_images.append({"name": name, "page_num": page_num, "box": box, "label": label,
+                                           "png": png, "score": score, "pdf_image": pdf_image})
                 except Exception as e:
                     warnings.append(f"Skipped {name}: {e}")
+
+        # Standard quality: only the document's worst images go to the AI. The line is measured, not chosen: the
+        # average image score, then the average of the scores that are below it.
+        if repairer:
+            engine_ai, conf, cfg, client = repairer
+            worst = conf.worst_line(p["score"] for p in pending_images if p["score"] is not None)
+            for p in pending_images:
+                if p["score"] is None or not conf.is_worst(p["score"], worst):
+                    continue
+                try:
+                    if step and not image_repairs:
+                        step("Repairing the worst images with AI")
+                    result = engine_ai.repair_image(client, cfg, pdf.pages[p["page_num"] - 1], p["box"],
+                                                    p["score"], p["pdf_image"])
+                    ai_tokens["in"] += result["tokens_in"]
+                    ai_tokens["out"] += result["tokens_out"]
+                    image_repairs.append({"name": p["name"], "page": p["page_num"], "accepted": result["accepted"],
+                                          "score_before": round(p["score"], 3),
+                                          "score_after": round(result["score_after"], 3),
+                                          "note": result["note"]})
+                    if result["accepted"]:
+                        p["png"], p["score"] = result["png"], result["score_after"]
+                except Exception as e:
+                    warnings.append(f"AI repair of {p['name']} failed: {e}")
+
+    for p in pending_images:
+        try:
+            key = f"assets/images/api-uploads/{doc_name}/{p['name']}.png"
+            put_object(key, p["png"], "image/png",
+                       {"source": "api-upload", "document": doc_name, "date": today, "type": "image"})
+            image_keys.append(key)
+            image_places.append({"key": key, "page": p["page_num"], "label": p["label"],
+                                 "box": [round(v, 1) for v in p["box"]],
+                                 "score": None if p["score"] is None else round(p["score"], 3)})
+        except Exception as e:
+            warnings.append(f"Skipped {p['name']}: {e}")
 
     text_key = put_json(
         f"processed/extracted/pdf/{doc_name}/text.json",
@@ -2881,6 +3293,9 @@ def extract_and_upload_pdf_parts(pdf_path, doc_name, today):
         "image_keys": image_keys,
     }
     parts["image_places"] = image_places
+    if repairer:
+        parts["image_repairs"] = image_repairs
+        parts["image_ai_tokens"] = ai_tokens
     parts["table_rows"] = table_rows
     return parts, table_summaries, warnings
 
@@ -2892,6 +3307,7 @@ def root():
 
 def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progress_id=""):
     """Upload a PDF, extract its parts and convert it to Markdown. Used for uploads and PDF links."""
+    job_started = time.time()   # the whole job: saving the PDF, tables and images, AI repair, conversion, uploads
     doc_name = safe_name(Path(filename).stem)
     today = date.today().isoformat()
 
@@ -2920,7 +3336,9 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
     image_places = []
     table_rows = []
     try:
-        parts, table_summaries, warnings = extract_and_upload_pdf_parts(tmp_path, doc_name, today)
+        parts, table_summaries, warnings = extract_and_upload_pdf_parts(
+            tmp_path, doc_name, today, step=step,
+            quality=(quality or os.getenv("ENGINE_QUALITY", "economy")).strip().lower() if tool == "engine" else "economy")
         image_places = parts.pop("image_places", [])
         table_rows = parts.pop("table_rows", [])
         uploaded.update(parts)
@@ -2953,7 +3371,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
                 set_progress_hook(None)
             except ImportError:
                 pass
-    seconds = round(time.time() - started, 2)
+    convert_seconds = round(time.time() - started, 2)   # only the Markdown conversion step
     engine_info = getattr(_engine_local, "info", None) if tool == "engine" else None
     if engine_info:
         engine_warnings = engine_info.pop("warnings", [])
@@ -2962,13 +3380,13 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
         engine_warnings = [w for w in engine_warnings if w not in skipped]
         engine_info["ai_skipped"] = bool(skipped)
         if skipped:
-            engine_warnings.append(
-                "AI repair was skipped. The Bedrock keys it needs are temporary, and they have expired or are not "
-                "available on this server right now, so this result is Economy quality."
-            )
+            engine_warnings.append("AI repair was skipped, so this result is Economy quality. " + " ".join(skipped))
         warnings = list(warnings) + engine_warnings
     if tool == "markitdown":
         converted = fix_markdown_tables(converted, table_rows)
+    if tool == "engine" and getattr(_engine_local, "json", None):
+        adopt_side_by_side_labels(image_places)
+        attach_image_anchors(tmp_path, _engine_local.json.get("elements", []), image_places)
     markdown_text = place_images(converted, image_places)
     if tool == "textract":
         # the page marks were only there to place pictures, and every picture already sits at its own place
@@ -2981,7 +3399,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
     json_text = None
     engine_json = getattr(_engine_local, "json", None) if tool == "engine" else None
     if engine_json is not None:
-        engine_json = add_image_elements(engine_json, uploaded.get("image_keys", []))
+        engine_json = add_image_elements(engine_json, uploaded.get("image_keys", []), image_places)
         engine_json["images"] = uploaded.get("image_keys", [])
         json_text = json.dumps(engine_json, ensure_ascii=False, indent=2)
         json_key = f"processed/json/engine/api-uploads/{doc_name}.json"
@@ -2990,6 +3408,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
         uploaded["json"] = json_key
 
     step("Done")
+    seconds = round(time.time() - job_started, 2)   # total time of the job
     return {
         **(extra or {}),
         "filename": filename,
@@ -3004,6 +3423,7 @@ def run_pdf_pipeline(tmp_path, filename, tool, extra=None, quality=None, progres
         "tables": table_summaries,
         "warnings": warnings,
         "seconds": seconds,
+        "convert_seconds": convert_seconds,
         "quality": engine_info["quality"] if engine_info else None,
         "engine": engine_info,
     }
@@ -3030,6 +3450,9 @@ def process_pdf(file: UploadFile = File(...), tool: str = Form("docling"), quali
 @app.get("/progress/{progress_id}")
 def job_progress(progress_id: str):
     """The stages a PDF job has reached so far, oldest first. The app asks for this while it waits."""
+    if RUNS_TABLE:
+        item = _ddb_safely(lambda table: table.get_item(Key={"run_id": progress_id}, ConsistentRead=True).get("Item")) or {}
+        return {"steps": [{"at": s["at"], "text": s["text"]} for s in item.get("steps", [])]}
     rows = _history(lambda db: db.execute(
         "select at, text from run_steps where run_id=? order by rowid", (progress_id,)).fetchall()) or []
     return {"steps": [{"at": at, "text": text} for at, text in rows]}
@@ -3038,6 +3461,26 @@ def job_progress(progress_id: str):
 @app.get("/runs")
 def job_history(limit: int = 30):
     """The latest PDF runs, newest first, with their status, time and result numbers."""
+    if RUNS_TABLE:
+        def scan(table):
+            items, kwargs = [], {}
+            while len(items) < 1000:   # the table only keeps a week of runs, so this stays small
+                page = table.scan(**kwargs)
+                items += page.get("Items", [])
+                if "LastEvaluatedKey" not in page:
+                    break
+                kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+            return items
+        items = sorted(_ddb_safely(scan) or [], key=lambda i: i.get("started_at", ""), reverse=True)
+        runs = []
+        for i in items[:max(1, min(limit, 200))]:
+            seconds = _plain_number(i.get("seconds"))
+            runs.append({"run_id": i["run_id"], "filename": i.get("filename", ""), "tool": i.get("tool", ""),
+                         "quality": i.get("quality", ""), "started_at": i.get("started_at", ""),
+                         "finished_at": i.get("finished_at"), "status": i.get("status", ""), "seconds": seconds,
+                         "error": i.get("error"), "summary": json.loads(i["summary"]) if i.get("summary") else {},
+                         "steps": [{"at": s["at"], "text": s["text"]} for s in i.get("steps", [])]})
+        return {"runs": runs}
     rows = _history(lambda db: db.execute(
         "select run_id, filename, tool, quality, started_at, finished_at, status, seconds, error, summary "
         "from runs order by started_at desc, rowid desc limit ?", (max(1, min(limit, 200)),)).fetchall()) or []
