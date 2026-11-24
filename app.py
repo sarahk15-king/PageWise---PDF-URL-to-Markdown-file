@@ -263,7 +263,12 @@ def show_result(result):
         with tabs[2]:
             try:
                 import source_view
-                source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}", images=images)
+                try:
+                    source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}", images=images)
+                except TypeError:
+                    # an older source_view.py that does not take images yet
+                    source_view.render(pdf_bytes, result["json_text"], key=f"sv_{result['s3_key']}")
+                    st.caption("source_view.py in GitHub is an old copy, so images are not shown here. Replace it with the new one.")
             except ImportError:
                 st.caption("The side-by-side view needs source_view.py next to app.py.")
     if result.get("json_text"):
