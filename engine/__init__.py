@@ -13,6 +13,7 @@ URL steps
 import os
 import re
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +52,76 @@ def azure_page_elements(pdf_path, page_no):
         return mdparse.blocks_to_elements(markdown, page_no, "azure", first_is_header=False)
     except Exception:
         return None
+
+
+_textract_error = [""]   # why the last Textract attempt gave nothing, shown in the page warning
+
+
+def textract_page_elements(pdf_path, page_no):
+    """OCR one scanned page with Amazon Textract when an S3 bucket is set (the cloud setup). Returns elements or None.
+
+    The page goes to Textract on its own. Textract's lines are NOT filtered by the pictures on the page, because a
+    scanned page is one big picture and filtering would remove all of its text."""
+    _textract_error[0] = ""
+    if not os.getenv("S3_BUCKET"):
+        _textract_error[0] = "S3_BUCKET is not set"
+        return None
+    key = None
+    try:
+        import uuid
+        from pypdf import PdfReader, PdfWriter
+        from .pdf import _main
+        m = _main()
+        writer = PdfWriter()
+        writer.add_page(PdfReader(str(pdf_path)).pages[page_no - 1])
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            writer.write(tmp)
+        try:
+            key = f"textract-input/ocr/{uuid.uuid4().hex}.pdf"
+            m.s3.upload_file(tmp.name, m.BUCKET, key)
+        finally:
+            os.unlink(tmp.name)
+        client = m.session.client("textract")
+        job = client.start_document_analysis(
+            DocumentLocation={"S3Object": {"Bucket": m.BUCKET, "Name": key}}, FeatureTypes=["TABLES"])["JobId"]
+        waited = 0
+        while True:
+            result = client.get_document_analysis(JobId=job)
+            if result["JobStatus"] != "IN_PROGRESS":
+                break
+            if waited >= m.TEXTRACT_MAX_WAIT:
+                _textract_error[0] = "Textract took too long on this page"
+                return None
+            time.sleep(2)
+            waited += 2
+        if result["JobStatus"] != "SUCCEEDED":
+            _textract_error[0] = f"Textract failed: {result.get('StatusMessage', result['JobStatus'])}"
+            return None
+        blocks = list(result["Blocks"])
+        while result.get("NextToken"):
+            result = client.get_document_analysis(JobId=job, NextToken=result["NextToken"])
+            blocks.extend(result["Blocks"])
+        # Textract's own confidence (0-100) for the lines it read: the score of a scanned page, which has no text layer
+        scores = [b["Confidence"] for b in blocks if b.get("BlockType") == "LINE" and "Confidence" in b]
+        ocr_confidence = round(sum(scores) / len(scores) / 100, 3) if scores else None
+        blocks = m.tx_merge_paragraphs(blocks)
+        markdown = m.tx_join_title_lines(m.tx_textract_to_markdown(blocks, page_marks=False))
+        found = mdparse.blocks_to_elements(markdown, page_no, "textract", first_is_header=False) if markdown.strip() else None
+        if not found:
+            _textract_error[0] = "Textract returned no text for this page"
+        elif ocr_confidence is not None:
+            for e in found:
+                e.data["ocr_confidence"] = ocr_confidence
+        return found
+    except Exception as error:
+        _textract_error[0] = f"{type(error).__name__}: {getattr(error, 'detail', error)}"
+        return None
+    finally:
+        if key:
+            try:
+                m.s3.delete_object(Bucket=m.BUCKET, Key=key)
+            except Exception:
+                pass
 
 
 _rapid = None   # the OCR model loads once, on the first scanned page
@@ -262,6 +333,23 @@ def rapidocr_page_elements(pdf_path, page_no):
     return elements
 
 
+_progress = threading.local()
+
+
+def set_progress_hook(fn):
+    """The API sets a function here to hear which stage the engine is in (None turns it off)."""
+    _progress.fn = fn
+
+
+def note(text):
+    fn = getattr(_progress, "fn", None)
+    if fn:
+        try:
+            fn(text)
+        except Exception:
+            pass
+
+
 def extract_pdf(path, image_store=None, out_dir=None, max_pages=60, quality="economy"):
     """PDF in, Document out (Document.to_markdown() and Document.to_json()).
 
@@ -269,6 +357,7 @@ def extract_pdf(path, image_store=None, out_dir=None, max_pages=60, quality="eco
     quality="standard": the same, then Amazon Nova repairs the weak tables and weak text (see engine/ai.py).
     """
     started = time.time()
+    note("Reading the text, tables and figures on each page")
     doc = Document(source=str(path), level="engine")
     if image_store is None:
         image_store = default_image_store(out_dir or tempfile.mkdtemp(prefix="engine_"))
@@ -278,12 +367,15 @@ def extract_pdf(path, image_store=None, out_dir=None, max_pages=60, quality="eco
 
     ocr_pages = 0
     if scanned:
+        note("Reading scanned pages with OCR")
         rebuilt = []
         for e in elements:
             if not e.data.get("scanned"):
                 rebuilt.append(e)
                 continue
             new = azure_page_elements(path, e.page)
+            if not new:
+                new = textract_page_elements(path, e.page)   # cloud: Amazon Textract
             if not new:
                 new = rapidocr_page_elements(path, e.page)   # free, local; used when Azure is not set up or fails
             if new:
@@ -292,15 +384,23 @@ def extract_pdf(path, image_store=None, out_dir=None, max_pages=60, quality="eco
                     n.flags.append("ocr")
                 rebuilt += new
             else:
-                doc.warnings.append(f"Page {e.page} has no text layer and no OCR is set up, so it was not read.")
+                why = f" Textract said: {_textract_error[0]}." if _textract_error[0] else ""
+                doc.warnings.append(f"Page {e.page} has no text layer and no OCR is set up, so it was not read.{why}")
                 rebuilt.append(e)
         elements = rebuilt
 
+    note("Putting the elements in reading order and scoring each one")
     doc.elements = mdparse.add_key_values([e for e in elements if e.type != "key_value"])
     mdparse.finish_flags(doc.elements)
+    for e in doc.elements:
+        # a scanned page has no text layer to check against, so its score is the OCR's own confidence
+        if "ocr" in e.flags and e.data.get("ocr_confidence") is not None:
+            e.confidence = e.data["ocr_confidence"]
+            e.data["score_before"] = e.data["ocr_confidence"]
     doc.number()
     if quality == "standard":
         from . import ai
+        note("Repairing weak tables and formulas with AI")
         ai.repair_document(doc, path)
     doc.timings["total_s"] = round(time.time() - started, 2)
     doc.cost["ocr_pages"] = ocr_pages
